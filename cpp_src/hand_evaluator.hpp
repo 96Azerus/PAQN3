@@ -54,21 +54,27 @@ namespace ofc {
         }
 
         inline int get_royalty(const CardSet& cards, const std::string& row_name) const {
-            // Requirement 1.4: Add Royal Flush to royalty maps
             static const std::unordered_map<std::string, int> ROYALTY_BOTTOM = {{"Straight", 2}, {"Flush", 4}, {"Full House", 6}, {"Four of a Kind", 10}, {"Straight Flush", 15}, {"Royal Flush", 25}};
             static const std::unordered_map<std::string, int> ROYALTY_MIDDLE = {{"Three of a Kind", 2}, {"Straight", 4}, {"Flush", 8}, {"Full House", 12}, {"Four of a Kind", 20}, {"Straight Flush", 30}, {"Royal Flush", 50}};
-            static const std::array<int, 13> ROYALTY_TOP_PAIRS = {0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8}; // Pairs 66-AA
-            static const std::array<int, 13> ROYALTY_TOP_TRIPS = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}; // Trips 222-AAA
+            
+            // --- ИСПРАВЛЕНИЕ: Таблицы роялти для верхней линии приведены в соответствие с правилами ---
+            static const std::map<int, int> ROYALTY_TOP_PAIRS = {
+                {4, 1}, {5, 2}, {6, 3}, {7, 4}, {8, 5}, {9, 6}, 
+                {10, 10}, {11, 11}, {12, 12} // Ранги: 6(4) ... Q(10), K(11), A(12)
+            };
+            static const std::map<int, int> ROYALTY_TOP_TRIPS = {
+                {0, 13}, {1, 14}, {2, 15}, {3, 16}, {4, 17}, {5, 18}, {6, 19}, 
+                {7, 20}, {8, 21}, {9, 22}, {10, 23}, {11, 24}, {12, 25} // Ранги: 2(0) ... A(12)
+            };
+            // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
             if (cards.empty()) return 0;
             HandRank hr = evaluate(cards);
             std::string final_hand_type = hr.type_str;
 
-            // Requirement 1.4: Explicitly check for Royal Flush
             if (hr.type_str == "Straight Flush") {
                 uint32_t rank_mask = 0;
                 for(Card c : cards) rank_mask |= (1 << get_rank(c));
-                // Ranks for A, K, Q, J, 10 are 12, 11, 10, 9, 8
                 if (rank_mask == ((1u<<12)|(1u<<11)|(1u<<10)|(1u<<9)|(1u<<8))) {
                     final_hand_type = "Royal Flush";
                 }
@@ -77,11 +83,13 @@ namespace ofc {
             if (row_name == "top") {
                 if (hr.hand_class == 6) { // Trips
                     int rank = get_rank(cards[0]);
-                    return ROYALTY_TOP_TRIPS[rank];
+                    auto it = ROYALTY_TOP_TRIPS.find(rank);
+                    return (it != ROYALTY_TOP_TRIPS.end()) ? it->second : 0;
                 } else if (hr.hand_class == 8) { // Pair
                     std::array<int, 3> ranks = {get_rank(cards[0]), get_rank(cards[1]), get_rank(cards[2])};
                     int pair_rank = (ranks[0] == ranks[1] || ranks[0] == ranks[2]) ? ranks[0] : ranks[1];
-                    if (pair_rank >= 4) return ROYALTY_TOP_PAIRS[pair_rank]; // Pair of 6s is rank 4
+                    auto it = ROYALTY_TOP_PAIRS.find(pair_rank);
+                    return (it != ROYALTY_TOP_PAIRS.end()) ? it->second : 0;
                 }
             } else if (row_name == "middle") {
                 auto it = ROYALTY_MIDDLE.find(final_hand_type);
