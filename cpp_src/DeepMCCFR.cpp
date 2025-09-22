@@ -60,7 +60,8 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
 
 std::atomic<uint64_t> DeepMCCFR::request_id_counter_{0};
 
-DeepMCCFR::DeepMCCFR(SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
+// --- ИСПРАВЛЕНИЕ: Добавлен 'action_limit' и его инициализация ---
+DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue,
                      LogQueue* log_queue) 
     : policy_buffer_(policy_buffer), 
@@ -68,6 +69,7 @@ DeepMCCFR::DeepMCCFR(SharedReplayBuffer* policy_buffer, SharedReplayBuffer* valu
       request_queue_(request_queue),
       result_queue_(result_queue),
       log_queue_(log_queue),
+      action_limit_(action_limit),
       rng_(std::random_device{}()),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
