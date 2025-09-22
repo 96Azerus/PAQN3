@@ -6,7 +6,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("OMP_MAX_ACTIVE_LEVELS", "1")
 os.environ.setdefault("PYTHONFAULTHANDLER", "1")
-os.environ.setdefault("HEAD_WARMUP_STEPS", "2000") # Requirement 2.2
+os.environ.setdefault("HEAD_WARMUP_STEPS", "2000")
 
 import sys
 import time
@@ -59,18 +59,16 @@ NUM_INFERENCE_WORKERS = 24
 NUM_CPP_WORKERS = 48
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
-# --- ГИПЕРПАРАМЕТРЫ (Requirement 2.3) ---
-ACTION_LIMIT = 100
+# --- ГИПЕРПАРАМЕТРЫ ---
 LEARNING_RATE = 0.0001
 BUFFER_CAPACITY = 1_000_000
 BATCH_SIZE = 512
 MIN_BUFFER_FILL_SAMPLES = 50000
-POLICY_LOSS_WEIGHT = 0.5
+POLICY_WEIGHT_START = 0.2
+POLICY_WEIGHT_END = 1.0
+POLICY_WEIGHT_SCHEDULE_STEPS = 100000
 ADV_CLIP_VALUE = 5.0
 VALUE_CLIP_VALUE = 50.0
-VALIDATION_BUFFER_SIZE = 50000
-VALIDATION_SPLIT_PROB = 0.01
-VALIDATION_INTERVAL_STEPS = 200
 RESULT_TTL_SECONDS = 120
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
@@ -82,16 +80,14 @@ GIT_PUSH_INTERVAL_STEPS = 100
 LOCAL_MODEL_DIR = "/content/local_models"
 MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "paqn_model_latest.pth")
 VERSION_FILE = os.path.join(LOCAL_MODEL_DIR, "latest_version.txt")
-GIT_OPPONENT_POOL_DIR = os.path.join(project_root, "opponent_pool")
 LOCAL_OPPONENT_POOL_DIR = os.path.join(LOCAL_MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
-LIVE_METRICS_FILE = os.path.join(LOCAL_MODEL_DIR, "live_metrics.json")
-GIT_MODEL_PATH = os.path.join(project_root, "paqn_model_latest.pth")
 
 # --- НАСТРОЙКИ GIT ---
 GIT_REPO_OWNER = "Azerus96"
-GIT_REPO_NAME = "PAQN"
+GIT_REPO_NAME = "PAQN3" # Убедитесь, что имя репозитория правильное
 GIT_BRANCH = "main"
+PUSH_REPO_DIR = "/content/PAQN3_for_push" # Временная директория для пуша
 
 def run_git_command(command, repo_path):
     try:
@@ -104,26 +100,50 @@ def run_git_command(command, repo_path):
         print(f"Git command timed out: {' '.join(command)}")
         return False
 
-def git_push(commit_message, repo_path, auth_repo_url):
+# --- ИЗМЕНЕНИЕ: Полностью переписанная функция для безопасного пуша ---
+def git_push(commit_message, auth_repo_url):
     print(f"\n--- Attempting to push to GitHub: '{commit_message}' ---")
-    if os.path.exists(MODEL_PATH):
-        shutil.copy2(MODEL_PATH, GIT_MODEL_PATH)
-        print(f"Copied {MODEL_PATH} to {GIT_MODEL_PATH}.")
     
-    os.makedirs(GIT_OPPONENT_POOL_DIR, exist_ok=True)
+    # 1. Подготовка временной директории
+    if os.path.exists(PUSH_REPO_DIR):
+        shutil.rmtree(PUSH_REPO_DIR)
+    
+    # 2. Клонирование чистой копии репозитория
+    print(f"Cloning a fresh copy of the repo into {PUSH_REPO_DIR}...")
+    clone_command = ["git", "clone", auth_repo_url, PUSH_REPO_DIR]
+    try:
+        subprocess.run(clone_command, check=True, capture_output=True, text=True, timeout=180)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"Failed to clone repository: {e.stderr if hasattr(e, 'stderr') else e}")
+        return
+
+    # 3. Копирование только необходимых артефактов
+    print("Copying model artifacts to the clean repo...")
+    # Копируем основную модель
+    if os.path.exists(MODEL_PATH):
+        shutil.copy2(MODEL_PATH, os.path.join(PUSH_REPO_DIR, "paqn_model_latest.pth"))
+    
+    # Копируем пул оппонентов
+    opponent_pool_git_path = os.path.join(PUSH_REPO_DIR, "opponent_pool")
+    os.makedirs(opponent_pool_git_path, exist_ok=True)
     if os.path.exists(LOCAL_OPPONENT_POOL_DIR):
         for f in glob.glob(os.path.join(LOCAL_OPPONENT_POOL_DIR, "*.pth")):
-            shutil.copy2(f, GIT_OPPONENT_POOL_DIR)
-        print(f"Synced local opponent pool to git directory.")
-
-    if not run_git_command(["git", "add", GIT_MODEL_PATH, GIT_OPPONENT_POOL_DIR], repo_path): return
-    status_result = subprocess.run(["git", "status", "--porcelain"], cwd=repo_path, capture_output=True, text=True)
+            shutil.copy2(f, opponent_pool_git_path)
+    
+    # 4. Выполнение Git операций в чистой директории
+    if not run_git_command(["git", "add", "paqn_model_latest.pth", "opponent_pool"], PUSH_REPO_DIR): return
+    
+    status_result = subprocess.run(["git", "status", "--porcelain"], cwd=PUSH_REPO_DIR, capture_output=True, text=True)
     if not status_result.stdout.strip():
         print("No changes to commit.")
+        shutil.rmtree(PUSH_REPO_DIR)
         return
-    if not run_git_command(["git", "commit", "-m", commit_message], repo_path): return
-    if not run_git_command(["git", "push", auth_repo_url, f"HEAD:{GIT_BRANCH}"], repo_path): return
+        
+    if not run_git_command(["git", "commit", "-m", commit_message], PUSH_REPO_DIR): return
+    if not run_git_command(["git", "push", "origin", f"HEAD:{GIT_BRANCH}"], PUSH_REPO_DIR): return
+    
     print("--- Push successful ---")
+    shutil.rmtree(PUSH_REPO_DIR)
 
 def git_pull(repo_path, auth_repo_url):
     print("\n--- Pulling latest model from GitHub ---")
@@ -210,7 +230,7 @@ class InferenceWorker(mp.Process):
             try:
                 try:
                     request_tuple = self.task_queue.get(timeout=1)
-                    req_id, is_policy, infoset, action_vectors, is_traverser_turn = request_tuple
+                    req_id, is_policy, infoset, action_vectors, is_traverser_turn, is_filter_request = request_tuple
                 except queue.Empty:
                     self._check_for_updates()
                     continue
@@ -223,7 +243,20 @@ class InferenceWorker(mp.Process):
                     
                     model_to_use = self.latest_model if is_traverser_turn else self.opponent_model
 
-                    if is_policy:
+                    # --- ИЗМЕНЕНИЕ: Добавлена обработка запроса на фильтрацию ---
+                    if is_filter_request:
+                        if not action_vectors:
+                            result = (req_id, True, [])
+                        else:
+                            num_actions = len(action_vectors)
+                            body_out_single = model_to_use.forward_body(infoset_tensor)
+                            body_out_batch = body_out_single.expand(num_actions, -1)
+                            actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
+                            street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0].expand(num_actions, -1)
+                            policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vector)
+                            predictions = policy_logits.cpu().numpy().flatten().tolist()
+                            result = (req_id, True, predictions) # Возвращаем как policy_result
+                    elif is_policy:
                         if not action_vectors:
                             result = (req_id, True, [])
                         else:
@@ -269,32 +302,23 @@ def update_opponent_pool(model_version):
         except OSError as e:
             print(f"Warning: Could not remove old opponent file: {e}")
 
-# Requirement 2.2: Differentiated learning rate and weight decay
 def get_params_for_optimizer(model, base_lr, weight_decay, head_lr_mult=2.0, head_wd=0.0):
     head_names = ["value_head", "action_proj", "street_proj", "policy_head_fc", "body_ln", "action_ln", "street_ln"]
     
-    params_body_decay = []
-    params_body_no_decay = []
-    params_head_decay = []
-    params_head_no_decay = []
+    params_body_decay, params_body_no_decay = [], []
+    params_head_decay, params_head_no_decay = [], []
 
     for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        
+        if not param.requires_grad: continue
         is_head = any(h_name in name for h_name in head_names)
         is_no_decay = param.dim() <= 1 or name.endswith(".bias") or "norm" in name
 
         if is_head:
-            if is_no_decay:
-                params_head_no_decay.append(param)
-            else:
-                params_head_decay.append(param)
-        else: # is_body
-            if is_no_decay:
-                params_body_no_decay.append(param)
-            else:
-                params_body_decay.append(param)
+            if is_no_decay: params_head_no_decay.append(param)
+            else: params_head_decay.append(param)
+        else:
+            if is_no_decay: params_body_no_decay.append(param)
+            else: params_body_decay.append(param)
     
     return [
         {'params': params_body_decay, 'weight_decay': weight_decay, 'lr': base_lr},
@@ -306,17 +330,12 @@ def get_params_for_optimizer(model, base_lr, weight_decay, head_lr_mult=2.0, hea
 def main():
     aim_run = aim.Run(experiment="paqn_ofc_poker_fix")
     aim_run["hparams"] = {
-        "num_cpp_workers": NUM_CPP_WORKERS,
-        "num_inference_workers": NUM_INFERENCE_WORKERS,
-        "learning_rate": LEARNING_RATE,
-        "buffer_capacity": BUFFER_CAPACITY,
-        "batch_size": BATCH_SIZE,
-        "action_limit": ACTION_LIMIT,
-        "policy_loss_weight": POLICY_LOSS_WEIGHT,
-        "adv_clip_value": ADV_CLIP_VALUE,
-        "value_clip_value": VALUE_CLIP_VALUE,
-        "head_lr_mult": 2.0,
-        "head_wd": 0.0,
+        "num_cpp_workers": NUM_CPP_WORKERS, "num_inference_workers": NUM_INFERENCE_WORKERS,
+        "learning_rate": LEARNING_RATE, "buffer_capacity": BUFFER_CAPACITY,
+        "batch_size": BATCH_SIZE, "policy_weight_start": POLICY_WEIGHT_START,
+        "policy_weight_end": POLICY_WEIGHT_END, "policy_weight_schedule": POLICY_WEIGHT_SCHEDULE_STEPS,
+        "adv_clip_value": ADV_CLIP_VALUE, "value_clip_value": VALUE_CLIP_VALUE,
+        "head_lr_mult": 2.0, "head_wd": 0.0,
         "head_warmup_steps": int(os.environ.get("HEAD_WARMUP_STEPS", "2000")),
     }
 
@@ -347,12 +366,14 @@ def main():
     
     os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
     os.makedirs(LOCAL_OPPONENT_POOL_DIR, exist_ok=True)
+    GIT_OPPONENT_POOL_DIR = os.path.join(project_root, "opponent_pool")
     if os.path.exists(GIT_OPPONENT_POOL_DIR):
         print("Syncing opponent pool from Git...")
         for f in glob.glob(os.path.join(GIT_OPPONENT_POOL_DIR, "*.pth")):
             shutil.copy2(f, LOCAL_OPPONENT_POOL_DIR)
         print(f"Synced {len(os.listdir(LOCAL_OPPONENT_POOL_DIR))} opponents.")
 
+    GIT_MODEL_PATH = os.path.join(project_root, "paqn_model_latest.pth")
     if os.path.exists(GIT_MODEL_PATH) and not os.path.exists(MODEL_PATH):
         shutil.copy2(GIT_MODEL_PATH, MODEL_PATH)
     
@@ -403,7 +424,7 @@ def main():
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
-        NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
+        NUM_CPP_WORKERS, policy_buffer, value_buffer,
         request_queue, result_dict, log_queue
     )
     
@@ -496,7 +517,7 @@ def main():
 
             model.train()
             
-            # Requirement 2.2: Head warmup logic
+            head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "2000"))
             if head_warmup_steps > 0 and global_step < head_warmup_steps:
                 head_names = ["value_head", "action_proj", "street_proj", "policy_head_fc", "body_ln", "action_ln", "street_ln"]
                 for name, param in model.named_parameters():
@@ -516,79 +537,65 @@ def main():
             if not p_batch: continue
             p_infosets_np, p_actions_np, p_advantages_np = p_batch
             
-            # --- VALUE LOSS (Requirement 2.1) ---
             v_infosets = torch.from_numpy(v_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
             v_targets = torch.from_numpy(v_targets_np).unsqueeze(1).to(device)
-            
-            # Train on raw targets, clipped for stability
             v_targets_clipped = torch.clamp(v_targets, -VALUE_CLIP_VALUE, VALUE_CLIP_VALUE)
             pred_values = model.forward_value_head(model.forward_body(v_infosets))
             loss_v = F.huber_loss(pred_values, v_targets_clipped, delta=1.0)
             
-            # --- POLICY LOSS (Requirement 2.1) ---
             p_infosets = torch.from_numpy(p_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
             p_actions = torch.from_numpy(p_actions_np).to(device)
-            p_advantages = torch.from_numpy(p_advantages_np).unsqueeze(1).to(device)
+            p_advantages = torch.from_numpy(p_advantages_np).to(device)
             
-            adv_mean, adv_std = p_advantages.mean(), p_advantages.std()
-            
-            # Requirement 2.3: Skip flat policy batches
-            update_skipped = 0
-            if adv_std.item() < 1e-6:
-                loss_p = torch.tensor(0.0, device=device, requires_grad=False)
-                update_skipped = 1
-            else:
-                # Z-score normalize advantages per batch
-                p_advantages_normalized = torch.clamp((p_advantages - adv_mean) / adv_std, -ADV_CLIP_VALUE, ADV_CLIP_VALUE)
-                p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-                body_out = model.forward_body(p_infosets)
-                pred_logits = model.forward_policy_head(body_out, p_actions, p_street_vector)
-                loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
+            # --- ИЗМЕНЕНИЕ: Ранговая нормализация преимущества ---
+            adv_ranks = torch.argsort(torch.argsort(p_advantages.squeeze())).float()
+            p_advantages_normalized = (adv_ranks / (adv_ranks.size(0) - 1) - 0.5) * 2.0
+            p_advantages_normalized = p_advantages_normalized.unsqueeze(1)
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+            p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+            body_out = model.forward_body(p_infosets)
+            pred_logits = model.forward_policy_head(body_out, p_actions, p_street_vector)
+            loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
 
             optimizer.zero_grad()
-            total_loss = loss_v + POLICY_LOSS_WEIGHT * loss_p
+            
+            # --- ИЗМЕНЕНИЕ: Динамический вес лосса политики ---
+            current_policy_weight = min(POLICY_WEIGHT_END, POLICY_WEIGHT_START + (POLICY_WEIGHT_END - POLICY_WEIGHT_START) * (global_step / POLICY_WEIGHT_SCHEDULE_STEPS))
+            total_loss = loss_v + current_policy_weight * loss_p
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
             total_loss.backward()
             grad_norm = clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
             
             value_losses.append(loss_v.item())
-            policy_losses.append(loss_p.item() if update_skipped == 0 else 0)
-            skipped_policy_updates.append(update_skipped)
+            policy_losses.append(loss_p.item())
             global_step += 1
             
-            # Requirement 3.1: Expanded Diagnostics
             if aim_run.active:
                 aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
                 aim_run.track(loss_p.item(), name="loss/policy_loss", step=global_step)
                 aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
+                aim_run.track(current_policy_weight, name="hparams/current_policy_weight", step=global_step)
                 
                 with torch.no_grad():
-                    # Raw target stats
                     aim_run.track(float(v_targets.std().item()), name="targets/value_raw/std", step=global_step)
                     aim_run.track(float(p_advantages.std().item()), name="targets/advantage_raw/std", step=global_step)
                     
-                    # Explained Variance
                     var_t = float(torch.var(v_targets_clipped))
                     ev = 1.0 - float(torch.var(v_targets_clipped - pred_values)) / max(var_t, 1e-6)
                     aim_run.track(ev, name="diagnostics/value_explained_var", step=global_step)
                     aim_run.track(var_t, name="diagnostics/value_target_var", step=global_step)
 
-                    # Policy Correlation
-                    if update_skipped == 0:
-                        y = p_advantages_normalized.cpu().numpy().flatten()
-                        yhat = pred_logits.cpu().numpy().flatten()
-                        if y.std() > 1e-6 and yhat.std() > 1e-6:
-                            corr = float(np.corrcoef(y, yhat)[0, 1])
-                            aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
+                    y = p_advantages_normalized.cpu().numpy().flatten()
+                    yhat = pred_logits.cpu().numpy().flatten()
+                    if y.std() > 1e-6 and yhat.std() > 1e-6:
+                        corr = float(np.corrcoef(y, yhat)[0, 1])
+                        aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
                     
-                    # Prediction stats
                     aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
-                    if update_skipped == 0:
-                        aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
-
-                # Skipped updates rate
-                skip_rate = np.mean(skipped_policy_updates) if skipped_policy_updates else 0
-                aim_run.track(skip_rate, name="diagnostics/skipped_policy_updates_rate", step=global_step)
+                    aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
 
             is_first_save = (global_step >= FIRST_SAVE_STEP) and (last_save_step < FIRST_SAVE_STEP)
             is_regular_save = (global_step - last_save_step) >= SAVE_INTERVAL_STEPS
@@ -609,7 +616,7 @@ def main():
                 last_save_step = global_step
             
             if training_started and (global_step - last_push_step) >= GIT_PUSH_INTERVAL_STEPS:
-                git_push(f"Periodic save: v{model_version}, step {global_step}", project_root, auth_repo_url)
+                git_push(f"Periodic save: v{model_version}, step {global_step}", auth_repo_url)
                 last_push_step = global_step
 
     except KeyboardInterrupt:
@@ -649,7 +656,7 @@ def main():
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, MODEL_PATH)
                 print("   ✅ Модель сохранена локально.", flush=True)
-                git_push(f"Final save on exit: v{model_version}, step {global_step}", project_root, auth_repo_url)
+                git_push(f"Final save on exit: v{model_version}, step {global_step}", auth_repo_url)
             except Exception as e:
                 print(f"   ---! ❌ ОШИБКА при финальном сохранении/пуше: {e}", flush=True)
         
