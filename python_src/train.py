@@ -74,7 +74,7 @@ VALUE_CLIP_VALUE = 50.0
 RESULT_TTL_SECONDS = 120
 
 # --- ГИПЕРПАРАМЕТРЫ ДЛЯ БАТЧИНГА ---
-INFERENCE_BATCH_SIZE = 256  # Увеличим, т.к. обработка станет эффективнее
+INFERENCE_BATCH_SIZE = 256
 INFERENCE_TIMEOUT_MS = 10
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
@@ -201,7 +201,7 @@ class InferenceWorker(mp.Process):
 
         groups = defaultdict(lambda: defaultdict(list))
         for req in batch:
-            req_id, is_policy, _, _, is_traverser_turn, is_filter = req
+            _, is_policy, _, _, is_traverser_turn, is_filter = req
             model_key = 'latest' if is_traverser_turn else 'opponent'
             req_type = 'filter' if is_filter else ('policy' if is_policy else 'value')
             groups[model_key][req_type].append(req)
@@ -221,9 +221,7 @@ class InferenceWorker(mp.Process):
                     if req_type not in requests_by_type: continue
                     
                     reqs = requests_by_type[req_type]
-                    
-                    # Прямолинейная сборка батча
-                    infosets, actions, street_vectors, splits = [], [], [], []
+                    infosets, actions, splits = [], [], []
                     for req in reqs:
                         action_vecs = req[3]
                         if action_vecs:
@@ -232,7 +230,7 @@ class InferenceWorker(mp.Process):
                             actions.extend(action_vecs)
                             splits.append(num_actions)
                     
-                    if not actions: # Если в батче не было ни одного запроса с действиями
+                    if not actions:
                         for req in reqs: self.result_dict[req[0]] = (req[0], True, [])
                         continue
 
@@ -241,8 +239,6 @@ class InferenceWorker(mp.Process):
                     street_tensor = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
 
                     logits, _ = model(infoset_tensor, action_tensor, street_tensor)
-                    
-                    # Разбираем результаты
                     results_flat = logits.cpu().numpy().flatten().tolist()
                     
                     current_pos = 0
@@ -458,9 +454,11 @@ def main():
             if not p_batch: continue
             p_infosets_np, p_actions_np, p_advantages_np = p_batch
             
+            # --- ИСПРАВЛЕНИЕ: Корректные вызовы для value и policy ---
             v_infosets = torch.from_numpy(v_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
             v_targets = torch.from_numpy(v_targets_np).unsqueeze(1).to(device)
             v_targets_clipped = torch.clamp(v_targets, -VALUE_CLIP_VALUE, VALUE_CLIP_VALUE)
+            # Вызов для Value: только инфосет
             pred_values = model(v_infosets)
             loss_v = F.huber_loss(pred_values, v_targets_clipped, delta=1.0)
             
@@ -473,6 +471,7 @@ def main():
             p_advantages_normalized = p_advantages_normalized.unsqueeze(1)
 
             p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+            # Вызов для Policy: инфосет, действия и вектор улицы
             pred_logits, _ = model(p_infosets, p_actions, p_street_vector)
             loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
 
