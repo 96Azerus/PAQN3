@@ -73,7 +73,7 @@ POLICY_WEIGHT_SCHEDULE_STEPS = 100000
 VALUE_CLIP_VALUE = 50.0
 RESULT_TTL_SECONDS = 120
 
-# --- ИЗМЕНЕНИЕ: Гиперпараметры для динамического батчинга ---
+# --- ГИПЕРПАРАМЕТРЫ ДЛЯ БАТЧИНГА ---
 INFERENCE_MAX_BATCH_SIZE = 512
 INFERENCE_BATCH_TIMEOUT_MS = 2.0 # 2 миллисекунды
 
@@ -161,8 +161,17 @@ class InferenceWorker(mp.Process):
                 self.latest_model.load_state_dict(state_dict.get('model_state_dict', state_dict))
                 self.model_version = state_dict.get('model_version', -1)
                 self._log(f"Loaded latest model (version {self.model_version}).")
-            else: self._log("No latest model found, using initialized weights.")
-        except Exception as e: self._log(f"!!! EXCEPTION during latest model loading: {e}")
+            else:
+                # === ИЗМЕНЕНИЕ: Фатальная ошибка, если основной модели нет ===
+                self._log(f"FATAL: No latest model found at {MODEL_PATH}. Worker cannot start.")
+                os._exit(1) # Немедленно завершаем дочерний процесс
+        except Exception as e:
+            # === ИЗМЕНЕНИЕ: Фатальная ошибка при любой проблеме с загрузкой ===
+            self._log(f"!!! FATAL EXCEPTION during latest model loading: {e}. Worker stopping.")
+            self._log(traceback.format_exc())
+            os._exit(1)
+        
+        # Загрузка оппонента остается без изменений, так как это не фатально
         try:
             opponent_pool_files = glob.glob(os.path.join(LOCAL_OPPONENT_POOL_DIR, "*.pth"))
             if opponent_pool_files:
@@ -187,25 +196,20 @@ class InferenceWorker(mp.Process):
                     self._load_models()
         except (IOError, ValueError) as e: self._log(f"Could not check for model update: {e}")
 
-    # --- ИЗМЕНЕНИЕ: Динамический сбор батча без долгого ожидания ---
     def collect_batch(self):
         batch = []
         try:
-            # Ждем первый элемент с очень коротким таймаутом, чтобы не блокировать процесс
             first_req = self.task_queue.get(timeout=INFERENCE_BATCH_TIMEOUT_MS / 1000.0)
             batch.append(first_req)
-            # Быстро собираем все, что уже есть в очереди, не превышая максимальный размер батча
             while len(batch) < INFERENCE_MAX_BATCH_SIZE:
                 batch.append(self.task_queue.get_nowait())
         except queue.Empty:
-            pass # Это нормальная ситуация, просто обрабатываем то, что успели собрать
+            pass
         return batch
 
-    # --- ИЗМЕНЕНИЕ: Оптимизированная обработка батча ---
     def process_batch(self, batch):
         if not batch: return
 
-        # Группируем запросы по модели (основная/оппонент) и типу (value/policy/filter)
         groups = defaultdict(lambda: defaultdict(list))
         for req in batch:
             _, is_policy, _, _, is_traverser_turn, is_filter = req
@@ -217,7 +221,6 @@ class InferenceWorker(mp.Process):
             for model_key, requests_by_type in groups.items():
                 model = self.latest_model if model_key == 'latest' else self.opponent_model
 
-                # Обработка value-запросов
                 if 'value' in requests_by_type:
                     reqs = requests_by_type['value']
                     infosets = torch.tensor([r[2] for r in reqs], dtype=torch.float32, device=self.device).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
@@ -225,13 +228,11 @@ class InferenceWorker(mp.Process):
                     for i, req in enumerate(reqs):
                         self.result_dict[req[0]] = (req[0], False, [values[i].item()])
 
-                # Обработка policy и filter запросов
                 for req_type in ['policy', 'filter']:
                     if req_type not in requests_by_type: continue
                     
                     reqs = requests_by_type[req_type]
                     
-                    # ОПТИМИЗАЦИЯ: Эффективная подготовка тензоров
                     unique_infosets, action_vectors, splits, req_ids_with_actions, req_ids_without_actions = [], [], [], [], []
                     infoset_map = {}
                     
@@ -383,9 +384,14 @@ def main():
             model_version = state_dict.get('model_version', 0)
             print(f"Loaded model, optimizer, and state. Resuming from step {global_step}, version {model_version}")
         except Exception as e:
-            print(f"Could not load full state, starting from scratch. Error: {e}")
-            model = OFC_CNN_Network().to(device)
-            optimizer = optim.AdamW(get_params_for_optimizer(model, LEARNING_RATE, weight_decay=0.01))
+            # === ИЗМЕНЕНИЕ: Фатальная ошибка, если файл модели поврежден ===
+            print(f"FATAL: Model file found at {MODEL_PATH}, but failed to load.")
+            print(f"Error: {e}")
+            print("This is likely due to a corrupted file or a Git LFS issue.")
+            print("Please check the file or delete it to start from scratch.")
+            sys.exit(1)
+    else:
+        print("No model file found. Starting training from scratch.")
 
     head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "2000"))
     if head_warmup_steps > 0: print(f"!!! HEAD-ONLY WARMUP ENABLED for {head_warmup_steps} steps !!!")
@@ -457,7 +463,9 @@ def main():
                 last_cleanup_time = time.time()
 
             if value_buffer.size() < min_fill or policy_buffer.size() < min_fill:
-                print(f"Waiting for buffer... P: {policy_buffer.size()}/{min_fill} | V: {value_buffer.size()}/{min_fill}", end='\r', flush=True)
+                # === ИЗМЕНЕНИЕ: Улучшенный вывод для логов Kaggle ===
+                if int(time.time()) % 10 == 0:
+                    print(f"Waiting for buffer... P: {policy_buffer.size():,}/{min_fill:,} | V: {value_buffer.size():,}/{min_fill:,}", flush=True)
                 time.sleep(1); continue
 
             if not training_started: print("\nBuffer ready. Starting training..."); training_started = True
