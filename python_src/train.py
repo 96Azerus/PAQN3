@@ -19,7 +19,7 @@ import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
 import traceback
-from collections import deque
+from collections import deque, defaultdict
 import multiprocessing as mp
 import queue
 import random
@@ -53,14 +53,18 @@ NUM_FEATURE_CHANNELS = 16
 NUM_SUITS = 4
 NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
+STREET_START_IDX = 9
+STREET_END_IDX = 14
 
 # --- НАСТРОЙКИ ---
-NUM_INFERENCE_WORKERS = 4
-NUM_CPP_WORKERS = 20
+# Оптимизированное количество воркеров: упор на C++ симуляции,
+# т.к. инференс с батчингом очень быстрый.
+NUM_INFERENCE_WORKERS = 2
+NUM_CPP_WORKERS = 22
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
-ACTION_LIMIT = 100 # Используется для поздних улиц, где перебор полный
+ACTION_LIMIT = 100
 LEARNING_RATE = 0.0001
 BUFFER_CAPACITY = 1_000_000
 BATCH_SIZE = 512
@@ -71,6 +75,10 @@ POLICY_WEIGHT_SCHEDULE_STEPS = 100000
 ADV_CLIP_VALUE = 5.0
 VALUE_CLIP_VALUE = 50.0
 RESULT_TTL_SECONDS = 120
+
+# --- НОВЫЕ ГИПЕРПАРАМЕТРЫ ДЛЯ БАТЧИНГА ---
+INFERENCE_BATCH_SIZE = 128  # Максимальный размер батча для инференса
+INFERENCE_TIMEOUT_MS = 10 # Максимальное время ожидания (в мс) для сбора батча
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
@@ -199,8 +207,7 @@ class InferenceWorker(mp.Process):
             self._log(f"!!! EXCEPTION during opponent model loading: {e}")
 
     def _check_for_updates(self):
-        self.request_counter += 1
-        if self.request_counter % 100 != 0 and time.time() - self.last_version_check_time < 5:
+        if time.time() - self.last_version_check_time < 5:
             return
         self.last_version_check_time = time.time()
         try:
@@ -214,59 +221,130 @@ class InferenceWorker(mp.Process):
         except (IOError, ValueError) as e:
             self._log(f"Could not check for model update: {e}")
 
+    def collect_batch(self):
+        """Собирает батч запросов из очереди."""
+        batch = []
+        try:
+            # Блокирующее ожидание первого элемента
+            first_req = self.task_queue.get(timeout=1.0)
+            batch.append(first_req)
+            # Неблокирующее чтение остальных элементов, пока не наберется батч
+            while len(batch) < INFERENCE_BATCH_SIZE:
+                batch.append(self.task_queue.get_nowait())
+        except queue.Empty:
+            pass # Это нормально, просто батч будет меньше максимального
+        return batch
+
+    def process_batch(self, batch):
+        """Обрабатывает собранный батч запросов."""
+        if not batch:
+            return
+
+        # Группируем запросы по типу и модели
+        # defaultdict(lambda: defaultdict(list)) создает вложенный словарь по требованию
+        # Структура: groups[model_name][request_type] = [list_of_requests]
+        groups = defaultdict(lambda: defaultdict(list))
+        for req in batch:
+            req_id, is_policy, infoset, action_vectors, is_traverser_turn, is_filter_request = req
+            model_key = 'latest' if is_traverser_turn else 'opponent'
+            
+            if is_filter_request:
+                req_type = 'filter'
+            elif is_policy:
+                req_type = 'policy'
+            else:
+                req_type = 'value'
+            
+            groups[model_key][req_type].append(req)
+
+        with torch.inference_mode():
+            for model_key, requests_by_type in groups.items():
+                model_to_use = self.latest_model if model_key == 'latest' else self.opponent_model
+
+                # --- Обработка Value-запросов ---
+                if 'value' in requests_by_type:
+                    value_reqs = requests_by_type['value']
+                    infosets = [req[2] for req in value_reqs]
+                    infoset_tensor = torch.tensor(infosets, dtype=torch.float32, device=self.device)
+                    infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
+                    
+                    body_out = model_to_use.forward_body(infoset_tensor)
+                    pred_values = model_to_use.forward_value_head(body_out)
+                    
+                    for i, req in enumerate(value_reqs):
+                        self.result_dict[req[0]] = (req[0], False, [pred_values[i].item()])
+
+                # --- Обработка Policy и Filter запросов (логика идентична) ---
+                for req_type in ['policy', 'filter']:
+                    if req_type not in requests_by_type:
+                        continue
+                    
+                    policy_reqs = requests_by_type[req_type]
+                    # Уникальные инфосеты и их обработка
+                    unique_infosets = {}
+                    for i, req in enumerate(policy_reqs):
+                        infoset_tuple = tuple(req[2])
+                        if infoset_tuple not in unique_infosets:
+                            unique_infosets[infoset_tuple] = []
+                        unique_infosets[infoset_tuple].append(i)
+
+                    infoset_list = [list(t) for t in unique_infosets.keys()]
+                    infoset_tensor = torch.tensor(infoset_list, dtype=torch.float32, device=self.device)
+                    infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
+                    
+                    body_out_unique = model_to_use.forward_body(infoset_tensor)
+
+                    # Собираем все action_vectors в один большой батч
+                    all_actions = []
+                    body_out_indices = []
+                    req_indices = []
+                    
+                    for i, (infoset_tuple, indices) in enumerate(unique_infosets.items()):
+                        for req_idx in indices:
+                            req = policy_reqs[req_idx]
+                            action_vectors = req[3]
+                            if action_vectors:
+                                all_actions.extend(action_vectors)
+                                body_out_indices.extend([i] * len(action_vectors))
+                                req_indices.append(req_idx)
+                    
+                    if all_actions:
+                        actions_tensor = torch.tensor(all_actions, dtype=torch.float32, device=self.device)
+                        body_out_batch = body_out_unique[body_out_indices]
+                        
+                        street_vectors = body_out_batch[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+                        
+                        policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vectors)
+                        predictions_flat = policy_logits.cpu().numpy().flatten().tolist()
+
+                        # Распределяем результаты обратно по запросам
+                        current_pos = 0
+                        for req_idx in req_indices:
+                            req = policy_reqs[req_idx]
+                            num_actions = len(req[3])
+                            req_id = req[0]
+                            
+                            predictions = predictions_flat[current_pos : current_pos + num_actions]
+                            self.result_dict[req_id] = (req_id, True, predictions)
+                            current_pos += num_actions
+                    
+                    # Обрабатываем запросы без action_vectors
+                    for req in policy_reqs:
+                        if not req[3]:
+                            self.result_dict[req[0]] = (req[0], True, [])
+
+
     def run(self):
         self._initialize()
         
-        STREET_START_IDX = 9
-        STREET_END_IDX = 14
-
         while not self.stop_event.is_set():
             try:
-                try:
-                    request_tuple = self.task_queue.get(timeout=1)
-                    req_id, is_policy, infoset, action_vectors, is_traverser_turn, is_filter_request = request_tuple
-                except queue.Empty:
+                batch = self.collect_batch()
+                if batch:
+                    self.process_batch(batch)
+                else:
+                    # Если не было запросов, проверяем обновления
                     self._check_for_updates()
-                    continue
-
-                self._check_for_updates()
-                
-                with torch.inference_mode():
-                    infoset_tensor = torch.tensor([infoset], dtype=torch.float32, device=self.device)
-                    infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
-                    
-                    model_to_use = self.latest_model if is_traverser_turn else self.opponent_model
-
-                    if is_filter_request:
-                        if not action_vectors:
-                            result = (req_id, True, [])
-                        else:
-                            num_actions = len(action_vectors)
-                            body_out_single = model_to_use.forward_body(infoset_tensor)
-                            body_out_batch = body_out_single.expand(num_actions, -1)
-                            actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
-                            street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0].expand(num_actions, -1)
-                            policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vector)
-                            predictions = policy_logits.cpu().numpy().flatten().tolist()
-                            result = (req_id, True, predictions)
-                    elif is_policy:
-                        if not action_vectors:
-                            result = (req_id, True, [])
-                        else:
-                            num_actions = len(action_vectors)
-                            body_out_single = model_to_use.forward_body(infoset_tensor)
-                            body_out_batch = body_out_single.expand(num_actions, -1)
-                            actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
-                            street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0].expand(num_actions, -1)
-                            policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vector)
-                            predictions = policy_logits.cpu().numpy().flatten().tolist()
-                            result = (req_id, True, predictions)
-                    else: # is_value
-                        value = model_to_use.forward_value_head(model_to_use.forward_body(infoset_tensor))
-                        result = (req_id, False, [value.item()])
-                    
-                    self.result_dict[req_id] = result
-
             except (KeyboardInterrupt, SystemExit):
                 break
             except Exception:
@@ -330,6 +408,8 @@ def main():
         "adv_clip_value": ADV_CLIP_VALUE, "value_clip_value": VALUE_CLIP_VALUE,
         "head_lr_mult": 2.0, "head_wd": 0.0,
         "head_warmup_steps": int(os.environ.get("HEAD_WARMUP_STEPS", "2000")),
+        "inference_batch_size": INFERENCE_BATCH_SIZE,
+        "inference_timeout_ms": INFERENCE_TIMEOUT_MS
     }
 
     def monitor_resources():
@@ -416,7 +496,6 @@ def main():
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
-    # --- ИСПРАВЛЕНИЕ: Добавлен недостающий аргумент ACTION_LIMIT ---
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
         request_queue, result_dict, log_queue
@@ -431,8 +510,6 @@ def main():
     last_stats_time = time.time()
     last_cleanup_time = time.time()
     
-    STREET_START_IDX = 9
-    STREET_END_IDX = 14
     training_started = False
     
     min_fill = BATCH_SIZE * 4 if global_step > 0 else MIN_BUFFER_FILL_SAMPLES
