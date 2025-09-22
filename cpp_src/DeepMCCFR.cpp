@@ -15,6 +15,11 @@
 
 namespace ofc {
 
+// --- НОВЫЕ КОНСТАНТЫ ДЛЯ ДВУХЭТАПНОГО ПОИСКА ---
+const size_t FIRST_STREET_CANDIDATES = 2000; // K: сколько случайных ходов генерировать
+const size_t FIRST_STREET_ACTION_LIMIT = 100; // N: сколько лучших ходов отбирать для глубокого анализа
+const size_t FIRST_STREET_RANDOM_EXPLORE = 5; // Сколько полностью случайных ходов добавлять к лучшим
+
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -53,14 +58,12 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
-// Requirement 1.5: Initialize the static atomic counter
 std::atomic<uint64_t> DeepMCCFR::request_id_counter_{0};
 
-DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
+DeepMCCFR::DeepMCCFR(SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue,
                      LogQueue* log_queue) 
-    : action_limit_(action_limit),
-      policy_buffer_(policy_buffer), 
+    : policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       request_queue_(request_queue),
       result_queue_(result_queue),
@@ -149,12 +152,98 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int current_player = state.get_current_player();
     
     std::vector<Action> legal_actions;
-    state.get_legal_actions(action_limit_, legal_actions, rng_);
     
+    // --- ИЗМЕНЕНИЕ: Двухэтапный поиск для первой улицы ---
+    if (state.get_street() == 1) {
+        std::vector<Action> candidates;
+        state.get_first_street_candidates(FIRST_STREET_CANDIDATES, candidates, rng_);
+        
+        if (candidates.size() <= FIRST_STREET_ACTION_LIMIT) {
+            legal_actions = candidates;
+        } else {
+            // Этап 1: Быстрая фильтрация
+            std::map<int, int> suit_map_filter;
+            GameState canonical_state_filter = state.get_canonical(suit_map_filter);
+            std::vector<float> infoset_vec_filter = featurize_state_cpp(canonical_state_filter, current_player);
+            
+            std::vector<std::vector<float>> canonical_action_vectors_filter;
+            canonical_action_vectors_filter.reserve(candidates.size());
+
+            for (const auto& original_action : candidates) {
+                Action canonical_action = original_action;
+                for (auto& placement : canonical_action.first) {
+                    if (placement.first != INVALID_CARD) {
+                        auto it = suit_map_filter.find(get_suit(placement.first));
+                        if (it != suit_map_filter.end()) {
+                            placement.first = get_rank(placement.first) * 4 + it->second;
+                        }
+                    }
+                }
+                canonical_action_vectors_filter.push_back(action_to_vector(canonical_action));
+            }
+
+            uint64_t filter_request_id = ++request_id_counter_;
+            {
+                py::gil_scoped_acquire acquire;
+                py::tuple filter_request = py::make_tuple(
+                    filter_request_id, true, py::cast(infoset_vec_filter), 
+                    py::cast(canonical_action_vectors_filter), py::bool_(true), py::bool_(true) // is_traverser_turn, is_filter_request
+                );
+                request_queue_->attr("put")(filter_request);
+            }
+
+            std::vector<float> logits;
+            while(true) {
+                bool got_item = false;
+                {
+                    py::gil_scoped_acquire acquire;
+                    py::object key = py::cast(filter_request_id);
+                    if (result_queue_->attr("__contains__")(key).cast<bool>()) {
+                        py::tuple result_tuple = (*result_queue_)[key].cast<py::tuple>();
+                        logits = result_tuple[2].cast<std::vector<float>>();
+                        result_queue_->attr("pop")(key);
+                        got_item = true;
+                    }
+                }
+                if (got_item) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+
+            // Этап 2: Отбор лучших + добавление случайных для исследования
+            std::vector<size_t> indices(candidates.size());
+            std::iota(indices.begin(), indices.end(), 0);
+            std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+                return logits[a] > logits[b];
+            });
+
+            std::vector<size_t> final_indices;
+            final_indices.reserve(FIRST_STREET_ACTION_LIMIT);
+            for(size_t i = 0; i < std::min((size_t)candidates.size(), FIRST_STREET_ACTION_LIMIT - FIRST_STREET_RANDOM_EXPLORE); ++i) {
+                final_indices.push_back(indices[i]);
+            }
+            
+            // Добавляем случайные для исследования
+            std::shuffle(indices.begin(), indices.end(), rng_);
+            for(size_t idx : indices) {
+                if (final_indices.size() >= FIRST_STREET_ACTION_LIMIT) break;
+                if (std::find(final_indices.begin(), final_indices.end(), idx) == final_indices.end()) {
+                    final_indices.push_back(idx);
+                }
+            }
+
+            legal_actions.reserve(final_indices.size());
+            for(size_t idx : final_indices) {
+                legal_actions.push_back(candidates[idx]);
+            }
+        }
+    } else {
+        state.get_later_street_actions(legal_actions, rng_);
+    }
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
     int num_actions = legal_actions.size();
     UndoInfo undo_info;
 
-    // Requirement 1.3: Skip inference for nodes with <= 1 action
     if (num_actions <= 1) {
         Action action_to_take = (num_actions == 1) ? legal_actions[0] : Action{{}, INVALID_CARD};
         state.apply_action(action_to_take, traversing_player, undo_info);
@@ -170,26 +259,25 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     std::vector<std::vector<float>> canonical_action_vectors;
     canonical_action_vectors.reserve(num_actions);
     
-    auto remap_card_safely = [&](Card& card) {
-        if (card == INVALID_CARD) return;
-        auto it = suit_map.find(get_suit(card));
-        if (it != suit_map.end()) {
-            card = get_rank(card) * 4 + it->second;
-        } else {
-            card = INVALID_CARD; 
-        }
-    };
-
     for (const auto& original_action : legal_actions) {
         Action canonical_action = original_action;
         for (auto& placement : canonical_action.first) {
-            remap_card_safely(placement.first);
+            if (placement.first != INVALID_CARD) {
+                auto it = suit_map.find(get_suit(placement.first));
+                if (it != suit_map.end()) {
+                    placement.first = get_rank(placement.first) * 4 + it->second;
+                }
+            }
         }
-        remap_card_safely(canonical_action.second);
+        if (canonical_action.second != INVALID_CARD) {
+            auto it = suit_map.find(get_suit(canonical_action.second));
+            if (it != suit_map.end()) {
+                canonical_action.second = get_rank(canonical_action.second) * 4 + it->second;
+            }
+        }
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
-    // Requirement 1.5: Use atomic counter for unique IDs
     uint64_t policy_request_id = ++request_id_counter_;
     uint64_t value_request_id = ++request_id_counter_;
 
@@ -198,12 +286,14 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     {
         py::gil_scoped_acquire acquire;
         py::tuple policy_request_tuple = py::make_tuple(
-            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors), py::bool_(is_traverser_turn)
+            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors), 
+            py::bool_(is_traverser_turn), py::bool_(false) // is_filter_request = false
         );
         request_queue_->attr("put")(policy_request_tuple);
 
         py::tuple value_request_tuple = py::make_tuple(
-            value_request_id, false, py::cast(infoset_vec), py::none(), py::bool_(is_traverser_turn)
+            value_request_id, false, py::cast(infoset_vec), py::none(), 
+            py::bool_(is_traverser_turn), py::bool_(false) // is_filter_request = false
         );
         request_queue_->attr("put")(value_request_tuple);
     }
@@ -280,7 +370,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
-    // Requirement 1.6: Keep Dirichlet noise only for the root node
     if (is_root) {
         add_dirichlet_noise(strategy, 0.3f, rng_);
     }
@@ -294,14 +383,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     auto it = action_payoffs.find(current_player);
     if (it != action_payoffs.end()) {
-        // Requirement 1.3: Only write to policy buffer if it's the traverser's turn
         if (current_player == traversing_player) {
-            // Requirement 1.1: Advantage is raw_return - value_baseline
             float advantage = it->second - value_baseline;
             policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
         }
         
-        // Requirement 1.1: Push raw, unnormalized payoff to the value buffer
         value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
     }
     return action_payoffs;
