@@ -28,7 +28,10 @@ namespace ofc {
 
         std::pair<float, float> get_payoffs(const HandEvaluator& evaluator) const;
         
-        void get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const;
+        // --- ИЗМЕНЕНИЕ: Разделение логики генерации действий ---
+        void get_first_street_candidates(size_t k, std::vector<Action>& out_actions, std::mt19937& rng) const;
+        void get_later_street_actions(std::vector<Action>& out_actions, std::mt19937& rng) const;
+        // --- КОНЕЦ ИЗМЕНЕНИЯ ---
         
         void apply_action(const Action& action, int player_view, UndoInfo& undo_info);
         
@@ -45,7 +48,6 @@ namespace ofc {
 
         const CardSet& get_my_discards(int player_idx) const { return my_discards_[player_idx]; }
         
-        // --- ИСПРАВЛЕНИЕ: Метод теперь вычисляет значение на лету, а не берет из поля ---
         int get_opponent_discard_count(int player_idx) const { 
             return (int)my_discards_[(player_idx + 1) % num_players_].size(); 
         }
@@ -73,7 +75,5 @@ namespace ofc {
         CardSet deck_;
         CardSet dealt_cards_;
         std::vector<CardSet> my_discards_;
-        // --- ИСПРАВЛЕНИЕ: Удалено избыточное и потенциально багованное поле ---
-        // std::vector<int> opponent_discard_counts_; 
     };
 }
