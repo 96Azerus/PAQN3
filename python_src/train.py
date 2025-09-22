@@ -57,8 +57,8 @@ STREET_START_IDX = 9
 STREET_END_IDX = 14
 
 # --- НАСТРОЙКИ ---
-NUM_INFERENCE_WORKERS = 2
-NUM_CPP_WORKERS = 22
+NUM_INFERENCE_WORKERS = 16
+NUM_CPP_WORKERS = 200
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -74,7 +74,7 @@ VALUE_CLIP_VALUE = 50.0
 RESULT_TTL_SECONDS = 120
 
 # --- ИЗМЕНЕНИЕ: Гиперпараметры для динамического батчинга ---
-INFERENCE_MAX_BATCH_SIZE = 256
+INFERENCE_MAX_BATCH_SIZE = 512
 INFERENCE_BATCH_TIMEOUT_MS = 2.0 # 2 миллисекунды
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
