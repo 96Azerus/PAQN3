@@ -10,7 +10,6 @@ namespace ofc {
 
     class Board {
     public:
-        // --- ИСПРАВЛЕНИЕ: Возвращаем std::array вместо поврежденных типов ---
         std::array<Card, 3> top;
         std::array<Card, 5> middle;
         std::array<Card, 5> bottom;
@@ -42,7 +41,6 @@ namespace ofc {
             return get_all_cards().size();
         }
 
-        // --- ОСТАЛЬНАЯ ЧАСТЬ ФАЙЛА ОСТАЕТСЯ БЕЗ ИЗМЕНЕНИЙ (как в вашем "оригинальном" файле) ---
         inline bool is_foul(const HandEvaluator& evaluator) const {
             if (get_card_count() != 13) return false;
             
@@ -68,36 +66,6 @@ namespace ofc {
                    evaluator.get_royalty(bot_cards, "bottom");
         }
 
-        inline bool qualifies_for_fantasyland(const HandEvaluator& evaluator) const {
-            if (is_foul(evaluator)) return false;
-            
-            CardSet top_cards = get_row_cards("top");
-
-            if (top_cards.size() != 3) return false;
-            HandRank hr = evaluator.evaluate(top_cards);
-            if (hr.type_str == "Pair") {
-                int r0 = get_rank(top_cards[0]), r1 = get_rank(top_cards[1]), r2 = get_rank(top_cards[2]);
-                int pair_rank = (r0 == r1 || r0 == r2) ? r0 : r1;
-                return pair_rank >= 10; // Ранг 10 - это Дама (Q)
-            }
-            return hr.type_str == "Trips";
-        }
-
-        inline int get_fantasyland_card_count(const HandEvaluator& evaluator) const {
-            if (!qualifies_for_fantasyland(evaluator)) return 0;
-            
-            CardSet top_cards = get_row_cards("top");
-
-            HandRank hr = evaluator.evaluate(top_cards);
-            if (hr.type_str == "Trips") return 17;
-            if (hr.type_str == "Pair") {
-                int r0 = get_rank(top_cards[0]), r1 = get_rank(top_cards[1]), r2 = get_rank(top_cards[2]);
-                int pair_rank = (r0 == r1 || r0 == r2) ? r0 : r1;
-                if (pair_rank == 10) return 14; // QQ
-                if (pair_rank == 11) return 15; // KK
-                if (pair_rank == 12) return 16; // AA
-            }
-            return 0;
-        }
+        // --- ИЗМЕНЕНИЕ: Логика "Фантазии" полностью удалена для упрощения ---
     };
 }
