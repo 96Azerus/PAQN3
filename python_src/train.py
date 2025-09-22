@@ -60,6 +60,7 @@ NUM_CPP_WORKERS = 48
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
+ACTION_LIMIT = 100 # Используется для поздних улиц, где перебор полный
 LEARNING_RATE = 0.0001
 BUFFER_CAPACITY = 1_000_000
 BATCH_SIZE = 512
@@ -85,9 +86,9 @@ MAX_OPPONENTS_IN_POOL = 20
 
 # --- НАСТРОЙКИ GIT ---
 GIT_REPO_OWNER = "Azerus96"
-GIT_REPO_NAME = "PAQN3" # Убедитесь, что имя репозитория правильное
+GIT_REPO_NAME = "PAQN3"
 GIT_BRANCH = "main"
-PUSH_REPO_DIR = "/content/PAQN3_for_push" # Временная директория для пуша
+PUSH_REPO_DIR = "/content/PAQN3_for_push"
 
 def run_git_command(command, repo_path):
     try:
@@ -100,15 +101,12 @@ def run_git_command(command, repo_path):
         print(f"Git command timed out: {' '.join(command)}")
         return False
 
-# --- ИЗМЕНЕНИЕ: Полностью переписанная функция для безопасного пуша ---
 def git_push(commit_message, auth_repo_url):
     print(f"\n--- Attempting to push to GitHub: '{commit_message}' ---")
     
-    # 1. Подготовка временной директории
     if os.path.exists(PUSH_REPO_DIR):
         shutil.rmtree(PUSH_REPO_DIR)
     
-    # 2. Клонирование чистой копии репозитория
     print(f"Cloning a fresh copy of the repo into {PUSH_REPO_DIR}...")
     clone_command = ["git", "clone", auth_repo_url, PUSH_REPO_DIR]
     try:
@@ -117,20 +115,16 @@ def git_push(commit_message, auth_repo_url):
         print(f"Failed to clone repository: {e.stderr if hasattr(e, 'stderr') else e}")
         return
 
-    # 3. Копирование только необходимых артефактов
     print("Copying model artifacts to the clean repo...")
-    # Копируем основную модель
     if os.path.exists(MODEL_PATH):
         shutil.copy2(MODEL_PATH, os.path.join(PUSH_REPO_DIR, "paqn_model_latest.pth"))
     
-    # Копируем пул оппонентов
     opponent_pool_git_path = os.path.join(PUSH_REPO_DIR, "opponent_pool")
     os.makedirs(opponent_pool_git_path, exist_ok=True)
     if os.path.exists(LOCAL_OPPONENT_POOL_DIR):
         for f in glob.glob(os.path.join(LOCAL_OPPONENT_POOL_DIR, "*.pth")):
             shutil.copy2(f, opponent_pool_git_path)
     
-    # 4. Выполнение Git операций в чистой директории
     if not run_git_command(["git", "add", "paqn_model_latest.pth", "opponent_pool"], PUSH_REPO_DIR): return
     
     status_result = subprocess.run(["git", "status", "--porcelain"], cwd=PUSH_REPO_DIR, capture_output=True, text=True)
@@ -243,7 +237,6 @@ class InferenceWorker(mp.Process):
                     
                     model_to_use = self.latest_model if is_traverser_turn else self.opponent_model
 
-                    # --- ИЗМЕНЕНИЕ: Добавлена обработка запроса на фильтрацию ---
                     if is_filter_request:
                         if not action_vectors:
                             result = (req_id, True, [])
@@ -255,7 +248,7 @@ class InferenceWorker(mp.Process):
                             street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0].expand(num_actions, -1)
                             policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vector)
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
-                            result = (req_id, True, predictions) # Возвращаем как policy_result
+                            result = (req_id, True, predictions)
                     elif is_policy:
                         if not action_vectors:
                             result = (req_id, True, [])
@@ -423,8 +416,9 @@ def main():
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
+    # --- ИСПРАВЛЕНИЕ: Добавлен недостающий аргумент ACTION_LIMIT ---
     solver_manager = SolverManager(
-        NUM_CPP_WORKERS, policy_buffer, value_buffer,
+        NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
         request_queue, result_dict, log_queue
     )
     
@@ -485,10 +479,6 @@ def main():
 
             if time.time() - last_cleanup_time > 60:
                 now = time.time()
-                for key in result_dict.keys():
-                    if key not in result_timestamps:
-                        result_timestamps[key] = now
-                
                 keys_to_delete = [key for key, ts in result_timestamps.items() if now - ts > RESULT_TTL_SECONDS]
                 
                 if len(result_dict) > 10000 and keys_to_delete:
@@ -497,9 +487,9 @@ def main():
                         result_dict.pop(key, None)
                         result_timestamps.pop(key, None)
                 
-                if len(result_timestamps) > len(result_dict) * 2:
-                     current_keys = set(result_dict.keys())
-                     ts_keys_to_delete = [key for key in result_timestamps if key not in current_keys]
+                current_keys_set = set(result_dict.keys())
+                if len(result_timestamps) > len(current_keys_set) * 2:
+                     ts_keys_to_delete = [key for key in result_timestamps if key not in current_keys_set]
                      for key in ts_keys_to_delete:
                          result_timestamps.pop(key, None)
 
@@ -547,11 +537,9 @@ def main():
             p_actions = torch.from_numpy(p_actions_np).to(device)
             p_advantages = torch.from_numpy(p_advantages_np).to(device)
             
-            # --- ИЗМЕНЕНИЕ: Ранговая нормализация преимущества ---
             adv_ranks = torch.argsort(torch.argsort(p_advantages.squeeze())).float()
             p_advantages_normalized = (adv_ranks / (adv_ranks.size(0) - 1) - 0.5) * 2.0
             p_advantages_normalized = p_advantages_normalized.unsqueeze(1)
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
             body_out = model.forward_body(p_infosets)
@@ -560,10 +548,8 @@ def main():
 
             optimizer.zero_grad()
             
-            # --- ИЗМЕНЕНИЕ: Динамический вес лосса политики ---
             current_policy_weight = min(POLICY_WEIGHT_END, POLICY_WEIGHT_START + (POLICY_WEIGHT_END - POLICY_WEIGHT_START) * (global_step / POLICY_WEIGHT_SCHEDULE_STEPS))
             total_loss = loss_v + current_policy_weight * loss_p
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             total_loss.backward()
             grad_norm = clip_grad_norm_(model.parameters(), 5.0)
