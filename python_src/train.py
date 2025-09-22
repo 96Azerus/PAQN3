@@ -55,8 +55,8 @@ NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 
 # --- НАСТРОЙКИ ---
-NUM_INFERENCE_WORKERS = 24
-NUM_CPP_WORKERS = 48
+NUM_INFERENCE_WORKERS = 4
+NUM_CPP_WORKERS = 20
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
