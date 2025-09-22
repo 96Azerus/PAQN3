@@ -57,8 +57,9 @@ STREET_START_IDX = 9
 STREET_END_IDX = 14
 
 # --- НАСТРОЙКИ ---
-NUM_INFERENCE_WORKERS = 16
-NUM_CPP_WORKERS = 200
+# === ИЗМЕНЕНИЕ: Сбалансированная конфигурация для мощного CPU ===
+NUM_INFERENCE_WORKERS = 32
+NUM_CPP_WORKERS = 190  # Оставляем ~34 ядра для Python-воркеров и системы
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -394,7 +395,9 @@ def main():
         print("No model file found. Starting training from scratch.")
 
     head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "2000"))
-    if head_warmup_steps > 0: print(f"!!! HEAD-ONLY WARMUP ENABLED for {head_warmup_steps} steps !!!")
+    # === ИЗМЕНЕНИЕ: Убираем сбивающий с толку лог ===
+    if global_step < head_warmup_steps:
+        print(f"!!! HEAD-ONLY WARMUP ENABLED for the next {head_warmup_steps - global_step} steps !!!")
     
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
@@ -417,7 +420,7 @@ def main():
     last_stats_time, last_cleanup_time = time.time(), time.time()
     training_started = False
     min_fill = BATCH_SIZE * 4 if global_step > 0 else MIN_BUFFER_FILL_SAMPLES
-    print(f"Training will start when buffer size reaches {min_fill} samples.")
+    print(f"Training will start when buffer size reaches {min_fill:,} samples.")
     last_save_step, last_push_step = global_step, global_step
     result_timestamps = {}
 
@@ -464,7 +467,7 @@ def main():
 
             if value_buffer.size() < min_fill or policy_buffer.size() < min_fill:
                 # === ИЗМЕНЕНИЕ: Улучшенный вывод для логов Kaggle ===
-                if int(time.time()) % 10 == 0:
+                if int(time.time()) % 5 == 0:
                     print(f"Waiting for buffer... P: {policy_buffer.size():,}/{min_fill:,} | V: {value_buffer.size():,}/{min_fill:,}", flush=True)
                 time.sleep(1); continue
 
