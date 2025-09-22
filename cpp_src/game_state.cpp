@@ -98,20 +98,16 @@ namespace ofc {
         std::vector<Action>& out_actions
     ) const {
         if (current_indices.size() == (size_t)k) {
-            // Requirement 1.2: Generate permutations of cards for the chosen slots
             CardSet p_cards = cards_to_place;
-            std::sort(p_cards.begin(), p_cards.end()); // Start with a canonical permutation
+            std::sort(p_cards.begin(), p_cards.end());
             
-            // For k > 2, this generates all permutations, which might be slow.
-            // The spec specifically targets k=2. This implementation is general but
-            // for k=2 it will correctly generate the 2 permutations.
             do {
                 std::vector<Placement> placement;
                 placement.reserve(k);
                 for(int i = 0; i < k; ++i) {
                     placement.push_back({p_cards[i], available_slots[current_indices[i]]});
                 }
-                std::sort(placement.begin(), placement.end()); // Sort placements for canonical action representation
+                std::sort(placement.begin(), placement.end());
                 out_actions.push_back({placement, discarded});
             } while (std::next_permutation(p_cards.begin(), p_cards.end()));
             
@@ -158,39 +154,42 @@ namespace ofc {
         }
     }
 
-    void GameState::get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const {
+    // --- НОВАЯ ФУНКЦИЯ для первой улицы ---
+    void GameState::get_first_street_candidates(size_t k, std::vector<Action>& out_actions, std::mt19937& rng) const {
         out_actions.clear();
-        if (is_terminal()) return;
+        if (is_terminal() || street_ != 1) return;
+        
+        CardSet cards_to_place = dealt_cards_;
+        generate_random_placements(cards_to_place, INVALID_CARD, out_actions, k, rng);
+        
+        std::sort(out_actions.begin(), out_actions.end());
+        out_actions.erase(std::unique(out_actions.begin(), out_actions.end()), out_actions.end());
+    }
 
-        if (street_ > 1) {
-            const Board& board = boards_[current_player_];
-            std::vector<std::pair<std::string, int>> available_slots;
-            available_slots.reserve(13);
-            for(int i=0; i<3; ++i) if(board.top[i] == INVALID_CARD) available_slots.push_back({"top", i});
-            for(int i=0; i<5; ++i) if(board.middle[i] == INVALID_CARD) available_slots.push_back({"middle", i});
-            for(int i=0; i<5; ++i) if(board.bottom[i] == INVALID_CARD) available_slots.push_back({"bottom", i});
+    // --- СТАРАЯ ФУНКЦИЯ, переименованная и упрощенная ---
+    void GameState::get_later_street_actions(std::vector<Action>& out_actions, std::mt19937& rng) const {
+        out_actions.clear();
+        if (is_terminal() || street_ == 1) return;
 
-            for (size_t i = 0; i < dealt_cards_.size(); ++i) {
-                CardSet cards_to_place;
-                Card current_discarded = dealt_cards_[i];
-                for (size_t j = 0; j < dealt_cards_.size(); ++j) {
-                    if (i != j) cards_to_place.push_back(dealt_cards_[j]);
-                }
-                std::vector<int> indices;
-                generate_all_placements_recursive(cards_to_place, available_slots, indices, 0, cards_to_place.size(), current_discarded, out_actions);
+        const Board& board = boards_[current_player_];
+        std::vector<std::pair<std::string, int>> available_slots;
+        available_slots.reserve(13);
+        for(int i=0; i<3; ++i) if(board.top[i] == INVALID_CARD) available_slots.push_back({"top", i});
+        for(int i=0; i<5; ++i) if(board.middle[i] == INVALID_CARD) available_slots.push_back({"middle", i});
+        for(int i=0; i<5; ++i) if(board.bottom[i] == INVALID_CARD) available_slots.push_back({"bottom", i});
+
+        for (size_t i = 0; i < dealt_cards_.size(); ++i) {
+            CardSet cards_to_place;
+            Card current_discarded = dealt_cards_[i];
+            for (size_t j = 0; j < dealt_cards_.size(); ++j) {
+                if (i != j) cards_to_place.push_back(dealt_cards_[j]);
             }
-        } else { 
-            CardSet cards_to_place = dealt_cards_;
-            generate_random_placements(cards_to_place, INVALID_CARD, out_actions, action_limit, rng);
+            std::vector<int> indices;
+            generate_all_placements_recursive(cards_to_place, available_slots, indices, 0, cards_to_place.size(), current_discarded, out_actions);
         }
         
         std::sort(out_actions.begin(), out_actions.end());
         out_actions.erase(std::unique(out_actions.begin(), out_actions.end()), out_actions.end());
-
-        if (action_limit > 0 && out_actions.size() > action_limit) {
-            std::shuffle(out_actions.begin(), out_actions.end(), rng);
-            out_actions.resize(action_limit);
-        }
     }
 
     void GameState::apply_action(const Action& action, int player_view, UndoInfo& undo_info) {
