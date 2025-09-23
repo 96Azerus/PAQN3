@@ -47,7 +47,7 @@ private:
     LogQueue* log_queue_;
 
     size_t action_limit_;
-    std::mt19_937 rng_;
+    std::mt19937 rng_;
     std::vector<float> dummy_action_vec_;
     
     static std::atomic<uint64_t> request_id_counter_;
