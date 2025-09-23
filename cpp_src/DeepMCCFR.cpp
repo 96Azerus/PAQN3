@@ -15,10 +15,10 @@
 
 namespace ofc {
 
-// --- НОВЫЕ КОНСТАНТЫ ДЛЯ ДВУХЭТАПНОГО ПОИСКА ---
-const size_t FIRST_STREET_CANDIDATES = 2000; // K: сколько случайных ходов генерировать
-const size_t FIRST_STREET_ACTION_LIMIT = 100; // N: сколько лучших ходов отбирать для глубокого анализа
-const size_t FIRST_STREET_RANDOM_EXPLORE = 5; // Сколько полностью случайных ходов добавлять к лучшим
+// ... (константы и action_to_vector без изменений) ...
+const size_t FIRST_STREET_CANDIDATES = 2000;
+const size_t FIRST_STREET_ACTION_LIMIT = 100;
+const size_t FIRST_STREET_RANDOM_EXPLORE = 5;
 
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
@@ -58,16 +58,20 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
+
 std::atomic<uint64_t> DeepMCCFR::request_id_counter_{0};
 
-// --- ИСПРАВЛЕНИЕ: Добавлен 'action_limit' и его инициализация ---
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
-                     InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue,
+                     InferenceRequestQueue* request_queue, 
+                     // === ИЗМЕНЕНИЕ: Принимаем указатель на массив и его ширину ===
+                     float* result_array, size_t result_row_size,
                      LogQueue* log_queue) 
     : policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       request_queue_(request_queue),
-      result_queue_(result_queue),
+      // === ИЗМЕНЕНИЕ: Инициализируем новые члены класса ===
+      result_array_(result_array),
+      result_row_size_(result_row_size),
       log_queue_(log_queue),
       action_limit_(action_limit),
       rng_(std::random_device{}()),
@@ -81,17 +85,15 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true);
 }
 
+// ... (featurize_state_cpp без изменений) ...
 std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
     std::vector<float> features(INFOSET_SIZE, 0.0f);
-    
     const int P_BOARD_TOP = 0, P_BOARD_MID = 1, P_BOARD_BOT = 2, P_HAND = 3;
     const int O_BOARD_TOP = 4, O_BOARD_MID = 5, O_BOARD_BOT = 6;
     const int P_DISCARDS = 7, DECK_REMAINING = 8;
     const int IS_STREET_1 = 9, IS_STREET_2 = 10, IS_STREET_3 = 11, IS_STREET_4 = 12, IS_STREET_5 = 13;
     const int O_DISCARD_COUNT = 14, TURN = 15;
-    
     const int plane_size = NUM_SUITS * NUM_RANKS;
-
     auto set_card = [&](int channel, Card card) {
         if (card != INVALID_CARD) {
             int suit = get_suit(card);
@@ -99,48 +101,37 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
             features[channel * plane_size + suit * NUM_RANKS + rank] = 1.0f;
         }
     };
-
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
-
     for (Card c : my_board.top) set_card(P_BOARD_TOP, c);
     for (Card c : my_board.middle) set_card(P_BOARD_MID, c);
     for (Card c : my_board.bottom) set_card(P_BOARD_BOT, c);
-    
     for (Card c : state.get_dealt_cards()) set_card(P_HAND, c);
-
     for (Card c : opp_board.top) set_card(O_BOARD_TOP, c);
     for (Card c : opp_board.middle) set_card(O_BOARD_MID, c);
     for (Card c : opp_board.bottom) set_card(O_BOARD_BOT, c);
-
     for (Card c : state.get_my_discards(player_view)) set_card(P_DISCARDS, c);
-
     std::vector<bool> known_cards(52, false);
     auto mark_known = [&](Card c) { if (c != INVALID_CARD) known_cards[c] = true; };
     for (Card c : my_board.get_all_cards()) mark_known(c);
     for (Card c : opp_board.get_all_cards()) mark_known(c);
     for (Card c : state.get_dealt_cards()) mark_known(c);
     for (Card c : state.get_my_discards(player_view)) mark_known(c);
-    
     for (int c = 0; c < 52; ++c) {
         if (!known_cards[c]) {
             set_card(DECK_REMAINING, c);
         }
     }
-
     int street = state.get_street();
     if (street >= 1 && street <= 5) {
         int street_channel = IS_STREET_1 + (street - 1);
         std::fill(features.begin() + street_channel * plane_size, features.begin() + (street_channel + 1) * plane_size, 1.0f);
     }
-
     float opp_discard_val = static_cast<float>(state.get_opponent_discard_count(player_view)) / 4.0f;
     std::fill(features.begin() + O_DISCARD_COUNT * plane_size, features.begin() + (O_DISCARD_COUNT + 1) * plane_size, opp_discard_val);
-
     if (state.get_current_player() == player_view) {
         std::fill(features.begin() + TURN * plane_size, features.begin() + (TURN + 1) * plane_size, 1.0f);
     }
-
     return features;
 }
 
@@ -152,10 +143,9 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     }
 
     int current_player = state.get_current_player();
-    
     std::vector<Action> legal_actions;
     
-    // --- ИЗМЕНЕНИЕ: Двухэтапный поиск для первой улицы ---
+    // ... (логика выбора действий остается без изменений) ...
     if (state.get_street() == 1) {
         std::vector<Action> candidates;
         state.get_first_street_candidates(FIRST_STREET_CANDIDATES, candidates, rng_);
@@ -163,14 +153,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         if (candidates.size() <= FIRST_STREET_ACTION_LIMIT) {
             legal_actions = candidates;
         } else {
-            // Этап 1: Быстрая фильтрация
             std::map<int, int> suit_map_filter;
             GameState canonical_state_filter = state.get_canonical(suit_map_filter);
             std::vector<float> infoset_vec_filter = featurize_state_cpp(canonical_state_filter, current_player);
-            
             std::vector<std::vector<float>> canonical_action_vectors_filter;
             canonical_action_vectors_filter.reserve(candidates.size());
-
             for (const auto& original_action : candidates) {
                 Action canonical_action = original_action;
                 for (auto& placement : canonical_action.first) {
@@ -184,47 +171,37 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                 canonical_action_vectors_filter.push_back(action_to_vector(canonical_action));
             }
 
-            uint64_t filter_request_id = ++request_id_counter_;
+            // === ИЗМЕНЕНИЕ: Используем кольцевой буфер для ID запросов ===
+            uint64_t filter_request_id = (request_id_counter_++) % MAX_PENDING_REQUESTS;
+            
             {
                 py::gil_scoped_acquire acquire;
                 py::tuple filter_request = py::make_tuple(
                     filter_request_id, true, py::cast(infoset_vec_filter), 
-                    py::cast(canonical_action_vectors_filter), py::bool_(true), py::bool_(true) // is_traverser_turn, is_filter_request
+                    py::cast(canonical_action_vectors_filter), py::bool_(true), py::bool_(true)
                 );
                 request_queue_->attr("put")(filter_request);
             }
 
             std::vector<float> logits;
-            while(true) {
-                bool got_item = false;
-                {
-                    py::gil_scoped_acquire acquire;
-                    py::object key = py::cast(filter_request_id);
-                    if (result_queue_->attr("__contains__")(key).cast<bool>()) {
-                        py::tuple result_tuple = (*result_queue_)[key].cast<py::tuple>();
-                        logits = result_tuple[2].cast<std::vector<float>>();
-                        result_queue_->attr("pop")(key);
-                        got_item = true;
-                    }
-                }
-                if (got_item) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            // === ИЗМЕНЕНИЕ: Ждем результат в общей памяти ===
+            while(result_array_[filter_request_id * result_row_size_ + 1] == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
+            logits.assign(&result_array_[filter_request_id * result_row_size_ + 2], 
+                          &result_array_[filter_request_id * result_row_size_ + 2 + candidates.size()]);
+            result_array_[filter_request_id * result_row_size_ + 1] = 0; // Сбрасываем флаг
 
-            // Этап 2: Отбор лучших + добавление случайных для исследования
             std::vector<size_t> indices(candidates.size());
             std::iota(indices.begin(), indices.end(), 0);
             std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
                 return logits[a] > logits[b];
             });
-
             std::vector<size_t> final_indices;
             final_indices.reserve(FIRST_STREET_ACTION_LIMIT);
             for(size_t i = 0; i < std::min((size_t)candidates.size(), FIRST_STREET_ACTION_LIMIT - FIRST_STREET_RANDOM_EXPLORE); ++i) {
                 final_indices.push_back(indices[i]);
             }
-            
-            // Добавляем случайные для исследования
             std::shuffle(indices.begin(), indices.end(), rng_);
             for(size_t idx : indices) {
                 if (final_indices.size() >= FIRST_STREET_ACTION_LIMIT) break;
@@ -232,7 +209,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                     final_indices.push_back(idx);
                 }
             }
-
             legal_actions.reserve(final_indices.size());
             for(size_t idx : final_indices) {
                 legal_actions.push_back(candidates[idx]);
@@ -241,7 +217,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     } else {
         state.get_later_street_actions(legal_actions, rng_);
     }
-    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     int num_actions = legal_actions.size();
     UndoInfo undo_info;
@@ -280,8 +255,9 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
-    uint64_t policy_request_id = ++request_id_counter_;
-    uint64_t value_request_id = ++request_id_counter_;
+    // === ИЗМЕНЕНИЕ: Используем кольцевой буфер для ID запросов ===
+    uint64_t policy_request_id = (request_id_counter_++) % MAX_PENDING_REQUESTS;
+    uint64_t value_request_id = (request_id_counter_++) % MAX_PENDING_REQUESTS;
 
     bool is_traverser_turn = (current_player == traversing_player);
 
@@ -289,26 +265,26 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         py::gil_scoped_acquire acquire;
         py::tuple policy_request_tuple = py::make_tuple(
             policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors), 
-            py::bool_(is_traverser_turn), py::bool_(false) // is_filter_request = false
+            py::bool_(is_traverser_turn), py::bool_(false)
         );
         request_queue_->attr("put")(policy_request_tuple);
 
         py::tuple value_request_tuple = py::make_tuple(
             value_request_id, false, py::cast(infoset_vec), py::none(), 
-            py::bool_(is_traverser_turn), py::bool_(false) // is_filter_request = false
+            py::bool_(is_traverser_turn), py::bool_(false)
         );
         request_queue_->attr("put")(value_request_tuple);
     }
 
     std::vector<float> logits;
     float value_baseline = 0.0f;
-    int results_to_get = 2;
-    int results_gotten = 0;
-
+    
     auto start_time = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::seconds(30);
 
-    while(results_gotten < results_to_get) {
+    // === ИЗМЕНЕНИЕ: Ждем оба результата в общей памяти ===
+    while(result_array_[policy_request_id * result_row_size_ + 1] == 0 ||
+          result_array_[value_request_id * result_row_size_ + 1] == 0) {
         if (std::chrono::steady_clock::now() - start_time > timeout) {
             {
                 py::gil_scoped_acquire acquire;
@@ -319,41 +295,18 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             }
             return {{0, 0.0f}, {1, 0.0f}};
         }
-
-        bool got_item = false;
-        {
-            py::gil_scoped_acquire acquire;
-            py::object policy_key = py::cast(policy_request_id);
-            if (result_queue_->attr("__contains__")(policy_key).cast<bool>()) {
-                py::tuple result_tuple = (*result_queue_)[policy_key].cast<py::tuple>();
-                logits = result_tuple[2].cast<std::vector<float>>();
-                result_queue_->attr("pop")(policy_key);
-                results_gotten++;
-                got_item = true;
-            }
-
-            if (results_gotten < results_to_get) {
-                py::object value_key = py::cast(value_request_id);
-                if (result_queue_->attr("__contains__")(value_key).cast<bool>()) {
-                    py::tuple result_tuple = (*result_queue_)[value_key].cast<py::tuple>();
-                    if (!result_tuple[2].is_none()) {
-                        std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-                        if (!predictions.empty()) {
-                            value_baseline = predictions[0];
-                        }
-                    }
-                    result_queue_->attr("pop")(value_key);
-                    results_gotten++;
-                    got_item = true;
-                }
-            }
-        } 
-
-        if (!got_item) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
+    logits.assign(&result_array_[policy_request_id * result_row_size_ + 2], 
+                  &result_array_[policy_request_id * result_row_size_ + 2 + num_actions]);
+    value_baseline = result_array_[value_request_id * result_row_size_ + 0];
+
+    // Сбрасываем флаги
+    result_array_[policy_request_id * result_row_size_ + 1] = 0;
+    result_array_[value_request_id * result_row_size_ + 1] = 0;
+
+    // ... (остальная логика traverse без изменений) ...
     std::vector<float> strategy(num_actions);
     if (!logits.empty() && logits.size() == num_actions) {
         float max_logit = -std::numeric_limits<float>::infinity();
@@ -395,4 +348,4 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     return action_payoffs;
 }
 
-} // namespace ofc
+} // namespace ofc 
