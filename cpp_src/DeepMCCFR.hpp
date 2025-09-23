@@ -19,13 +19,18 @@ namespace ofc {
 
 using LogQueue = py::object;
 
+// === ИЗМЕНЕНИЕ: Константа для размера буфера результатов, должна совпадать с Python ===
+constexpr size_t MAX_PENDING_REQUESTS = 200 * 4; // NUM_CPP_WORKERS * 4
+
 class DeepMCCFR {
 public:
     DeepMCCFR(size_t action_limit,
               SharedReplayBuffer* policy_buffer, 
               SharedReplayBuffer* value_buffer, 
               InferenceRequestQueue* request_queue,
-              InferenceResultQueue* result_queue,
+              // === ИЗМЕНЕНИЕ: Принимаем указатель на массив и его ширину ===
+              float* result_array,
+              size_t result_row_size,
               LogQueue* log_queue);
     
     void run_traversal();
@@ -36,14 +41,15 @@ private:
     SharedReplayBuffer* value_buffer_;
     
     InferenceRequestQueue* request_queue_;
-    InferenceResultQueue* result_queue_;
+    // === ИЗМЕНЕНИЕ: Храним указатель на массив и его ширину ===
+    float* result_array_;
+    size_t result_row_size_;
     LogQueue* log_queue_;
 
     size_t action_limit_;
-    std::mt19937 rng_;
+    std::mt19_937 rng_;
     std::vector<float> dummy_action_vec_;
     
-    // Requirement 1.5: Static atomic counter for unique request IDs
     static std::atomic<uint64_t> request_id_counter_;
 
     std::map<int, float> traverse(GameState& state, int traversing_player, bool is_root);
