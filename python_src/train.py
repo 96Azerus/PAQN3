@@ -58,8 +58,8 @@ STREET_END_IDX = 14
 
 # --- НАСТРОЙКИ ---
 # === ИЗМЕНЕНИЕ: Сбалансированная конфигурация для мощного CPU ===
-NUM_INFERENCE_WORKERS = 32
-NUM_CPP_WORKERS = 190  # Оставляем ~34 ядра для Python-воркеров и системы
+NUM_INFERENCE_WORKERS = 64
+NUM_CPP_WORKERS = 64  # Оставляем ~34 ядра для Python-воркеров и системы
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -75,7 +75,7 @@ VALUE_CLIP_VALUE = 50.0
 RESULT_TTL_SECONDS = 120
 
 # --- ГИПЕРПАРАМЕТРЫ ДЛЯ БАТЧИНГА ---
-INFERENCE_MAX_BATCH_SIZE = 512
+INFERENCE_MAX_BATCH_SIZE = 256
 INFERENCE_BATCH_TIMEOUT_MS = 2.0 # 2 миллисекунды
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
