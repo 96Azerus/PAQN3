@@ -31,7 +31,6 @@ import psutil
 import threading
 import aim
 import json
-# === ИЗМЕНЕНИЕ: Импортируем модули для общей памяти ===
 from multiprocessing import shared_memory
 from multiprocessing.managers import SharedMemoryManager
 
@@ -51,18 +50,19 @@ if build_dir not in sys.path:
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
-# --- КОНСТАНТЫ ---
+# --- КОНСТАНТЫ (ЕДИНЫЙ ИСТОЧНИК) ---
 NUM_FEATURE_CHANNELS = 16
 NUM_SUITS = 4
 NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 STREET_START_IDX = 9
 STREET_END_IDX = 14
+FIRST_STREET_CANDIDATES = 2000 # Максимальное количество действий для фильтрации
 
 # --- НАСТРОЙКИ ---
-# === ИЗМЕНЕНИЕ: Разумное количество воркеров для снижения IPC-нагрузки ===
-NUM_INFERENCE_WORKERS = 16
-NUM_CPP_WORKERS = 48 # Соотношение 1:3 - классический баланс
+# Оптимизированные значения для 224-ядерной машины
+NUM_INFERENCE_WORKERS = 32
+NUM_CPP_WORKERS = 160 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -75,11 +75,10 @@ POLICY_WEIGHT_START = 0.2
 POLICY_WEIGHT_END = 1.0
 POLICY_WEIGHT_SCHEDULE_STEPS = 100000
 VALUE_CLIP_VALUE = 50.0
-RESULT_TTL_SECONDS = 120
 
 # --- ГИПЕРПАРАМЕТРЫ ДЛЯ БАТЧИНГА ---
 INFERENCE_MAX_BATCH_SIZE = 512
-INFERENCE_BATCH_TIMEOUT_MS = 5.0 # 5 миллисекунд
+INFERENCE_BATCH_TIMEOUT_MS = 5.0
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
@@ -87,7 +86,6 @@ FIRST_SAVE_STEP = 100
 SAVE_INTERVAL_STEPS = 100
 GIT_PUSH_INTERVAL_STEPS = 100
 
-# === ИЗМЕНЕНИЕ: Используем правильный путь для Kaggle ===
 BASE_DIR = "/kaggle/working"
 LOCAL_MODEL_DIR = os.path.join(BASE_DIR, "local_models")
 MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "paqn_model_latest.pth")
@@ -101,7 +99,6 @@ GIT_REPO_NAME = "PAQN3"
 GIT_BRANCH = "main"
 PUSH_REPO_DIR = os.path.join(BASE_DIR, "PAQN3_for_push")
 
-# ... (функции git_push, git_pull, update_opponent_pool, get_params_for_optimizer остаются без изменений) ...
 def run_git_command(command, repo_path):
     try:
         subprocess.run(command, cwd=repo_path, check=True, capture_output=True, text=True, timeout=120)
@@ -168,28 +165,24 @@ def get_params_for_optimizer(model, base_lr, weight_decay, head_lr_mult=2.0, hea
         {'params': params_head_no_decay, 'weight_decay': 0.0, 'lr': base_lr * head_lr_mult},
     ]
 
-# === ИЗМЕНЕНИЕ: Класс-обертка для работы с общим NumPy массивом ===
 class SharedNumpyArray:
     def __init__(self, shm, shape, dtype):
         self.shm = shm
         self.array = np.ndarray(shape, dtype=dtype, buffer=self.shm.buf)
 
     def __getstate__(self):
-        # Что передавать дочерним процессам
         return self.shm.name, self.array.shape, self.array.dtype
 
     def __setstate__(self, state):
-        # Как дочерние процессы восстанавливают объект
         name, shape, dtype = state
         self.shm = shared_memory.SharedMemory(name=name)
         self.array = np.ndarray(shape, dtype=dtype, buffer=self.shm.buf)
 
-# === ИЗМЕНЕНИЕ: InferenceWorker теперь использует быструю очередь и общую память ===
 class InferenceWorker(mp.Process):
-    def __init__(self, name, task_queue, result_array_wrapper, log_queue, stop_event):
+    def __init__(self, name, task_queue, result_shm_info, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
-        self.result_array_wrapper = result_array_wrapper
+        self.result_shm_info = result_shm_info
         self.log_queue = log_queue
         self.stop_event = stop_event
         self.model_version = -1
@@ -208,10 +201,11 @@ class InferenceWorker(mp.Process):
         self._load_models()
         self.latest_model.eval()
         self.opponent_model.eval()
-        # Подключаемся к общей памяти
-        self.result_array = self.result_array_wrapper.array
+        
+        shm_name, shape, dtype = self.result_shm_info
+        self.result_shm = shared_memory.SharedMemory(name=shm_name)
+        self.result_array = np.ndarray(shape, dtype=dtype, buffer=self.result_shm.buf)
 
-    # ... (методы _load_models, _check_for_updates, collect_batch остаются такими же) ...
     def _load_models(self):
         try:
             if os.path.exists(MODEL_PATH):
@@ -265,71 +259,67 @@ class InferenceWorker(mp.Process):
     def process_batch(self, batch):
         if not batch: return
 
-        groups = defaultdict(lambda: defaultdict(list))
+        groups = defaultdict(list)
         for req in batch:
-            req_id, is_policy, _, _, is_traverser_turn, is_filter = req
+            # Новый формат запроса: (req_id, infoset, action_vectors, is_traverser_turn, is_filter)
+            is_traverser_turn = req[3]
             model_key = 'latest' if is_traverser_turn else 'opponent'
-            req_type = 'filter' if is_filter else ('policy' if is_policy else 'value')
-            groups[model_key][req_type].append(req)
+            groups[model_key].append(req)
 
         with torch.inference_mode():
-            for model_key, requests_by_type in groups.items():
+            for model_key, reqs in groups.items():
                 model = self.latest_model if model_key == 'latest' else self.opponent_model
+                
+                infosets = torch.tensor([r[1] for r in reqs], dtype=torch.float32, device=self.device).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
+                
+                # Сначала прогоняем все через тело сети
+                body_outputs = model.forward_body(infosets)
+                
+                # Затем вычисляем value для всех
+                values = model.forward_value_head(body_outputs)
 
-                if 'value' in requests_by_type:
-                    reqs = requests_by_type['value']
-                    infosets = torch.tensor([r[2] for r in reqs], dtype=torch.float32, device=self.device).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
-                    values = model(infosets)
-                    for i, req in enumerate(reqs):
-                        req_id = req[0]
-                        # Прямая запись в общую память
-                        self.result_array[req_id, 0] = values[i].item()
-                        self.result_array[req_id, 1] = 1 # Флаг готовности
+                # Разделяем запросы на те, которым нужна только оценка (value), и те, которым нужна и политика
+                policy_req_indices = [i for i, r in enumerate(reqs) if r[2] is not None]
+                
+                # Записываем результаты для всех запросов
+                for i, req in enumerate(reqs):
+                    req_id = req[0]
+                    self.result_array[req_id, 0] = values[i].item()
+                    # Если политика не нужна, ставим флаг готовности
+                    if i not in policy_req_indices:
+                        self.result_array[req_id, 1] = 1
 
-                for req_type in ['policy', 'filter']:
-                    if req_type not in requests_by_type: continue
-                    
-                    reqs = requests_by_type[req_type]
-                    
-                    unique_infosets, action_vectors, splits, req_ids_with_actions, req_ids_without_actions = [], [], [], [], []
-                    infoset_map = {}
-                    
-                    for req in reqs:
-                        req_id, _, infoset_list, action_vecs, _, _ = req
-                        if not action_vecs:
-                            req_ids_without_actions.append(req_id)
-                            continue
-                        
-                        infoset_tuple = tuple(infoset_list)
-                        if infoset_tuple not in infoset_map:
-                            infoset_map[infoset_tuple] = len(unique_infosets)
-                            unique_infosets.append(infoset_list)
-                        
-                        action_vectors.extend(action_vecs)
-                        splits.append((infoset_map[infoset_tuple], len(action_vecs)))
-                        req_ids_with_actions.append(req_id)
+                # Если есть запросы на политику, обрабатываем их
+                if policy_req_indices:
+                    # Собираем все векторы действий в один большой батч
+                    action_vectors = []
+                    splits = []
+                    for i in policy_req_indices:
+                        action_vecs_for_req = reqs[i][2]
+                        action_vectors.extend(action_vecs_for_req)
+                        splits.append(len(action_vecs_for_req))
 
-                    for req_id in req_ids_without_actions:
-                        # Записываем результат для запросов без действий
-                        self.result_array[req_id, 1] = 1 # Флаг готовности
-                    if not req_ids_with_actions:
-                        continue
-
-                    unique_infoset_tensor = torch.tensor(unique_infosets, dtype=torch.float32, device=self.device).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                     action_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
                     
-                    repeat_counts = [num_actions for _, num_actions in splits]
-                    infoset_indices = torch.repeat_interleave(torch.arange(len(unique_infosets), device=self.device), torch.tensor(repeat_counts, device=self.device))
+                    # Повторяем body_outputs и infosets в соответствии с количеством действий
+                    policy_body_outputs = body_outputs[policy_req_indices]
+                    policy_infosets = infosets[policy_req_indices]
                     
-                    infoset_tensor = unique_infoset_tensor[infoset_indices]
-                    street_tensor = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-
-                    logits, _ = model(infoset_tensor, action_tensor, street_tensor)
+                    repeat_counts = torch.tensor(splits, device=self.device)
+                    repeated_body_outputs = torch.repeat_interleave(policy_body_outputs, repeat_counts, dim=0)
+                    repeated_infosets = torch.repeat_interleave(policy_infosets, repeat_counts, dim=0)
+                    
+                    street_tensor = repeated_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+                    
+                    logits = model.forward_policy_head(repeated_body_outputs, action_tensor, street_tensor)
+                    
                     results_flat = logits.cpu().numpy().flatten()
                     
                     current_pos = 0
-                    for i, req_id in enumerate(req_ids_with_actions):
-                        _, num_actions = splits[i]
+                    for i, num_actions in enumerate(splits):
+                        req_idx_in_batch = policy_req_indices[i]
+                        req_id = reqs[req_idx_in_batch][0]
+                        
                         # Записываем результаты в общую память
                         self.result_array[req_id, 2:2+num_actions] = results_flat[current_pos : current_pos + num_actions]
                         self.result_array[req_id, 1] = 1 # Флаг готовности
@@ -349,9 +339,9 @@ class InferenceWorker(mp.Process):
                 self._log(f"---!!! EXCEPTION IN {self.name} !!!---")
                 self._log(traceback.format_exc())
         self._log("Stopped.")
+        self.result_shm.close()
 
 def main():
-    # === ИЗМЕНЕНИЕ: Используем SharedMemoryManager для управления общей памятью ===
     with SharedMemoryManager() as smm:
         aim_run = aim.Run(experiment="paqn_ofc_poker_fix")
         aim_run["hparams"] = {
@@ -364,7 +354,6 @@ def main():
             "inference_max_batch_size": INFERENCE_MAX_BATCH_SIZE, "inference_batch_timeout_ms": INFERENCE_BATCH_TIMEOUT_MS
         }
 
-        # ... (monitor_resources, git setup) ...
         def monitor_resources():
             p = psutil.Process(os.getpid())
             while True:
@@ -431,34 +420,33 @@ def main():
         policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
         value_buffer = ReplayBuffer(BUFFER_CAPACITY)
         
-        # === ИЗМЕНЕНИЕ: Создаем быструю очередь и общую память ===
-        # Максимальное количество запросов, которые могут быть "в полете"
         MAX_PENDING_REQUESTS = NUM_CPP_WORKERS * 4 
-        # Максимальное количество действий для policy-запроса + 2 слота (value, флаг)
-        RESULT_ROW_SIZE = ACTION_LIMIT + 2 
+        RESULT_ROW_SIZE = FIRST_STREET_CANDIDATES + 2 
         
-        # 1. Быстрая очередь для запросов
         request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 16)
         
-        # 2. Общая память для результатов
-        # Создаем Shared Memory блок
         shm = smm.SharedMemory(size=MAX_PENDING_REQUESTS * RESULT_ROW_SIZE * np.dtype(np.float32).itemsize)
-        # Создаем обертку, которую можно передавать процессам
-        result_array_wrapper = SharedNumpyArray(shm, (MAX_PENDING_REQUESTS, RESULT_ROW_SIZE), np.float32)
-        # Инициализируем нулями
-        result_array_wrapper.array.fill(0)
+        result_array = np.ndarray((MAX_PENDING_REQUESTS, RESULT_ROW_SIZE), dtype=np.float32, buffer=shm.buf)
+        result_array.fill(0)
         
-        # 3. Обычная очередь для логов (здесь производительность не критична)
         log_queue = mp.Manager().Queue()
-        
         stop_event = mp.Event()
 
-        inference_workers = [InferenceWorker(f"InferenceWorker-{i}", request_queue, result_array_wrapper, log_queue, stop_event) for i in range(NUM_INFERENCE_WORKERS)]
+        inference_workers = [InferenceWorker(f"InferenceWorker-{i}", request_queue, (shm.name, result_array.shape, result_array.dtype), log_queue, stop_event) for i in range(NUM_INFERENCE_WORKERS)]
         for w in inference_workers: w.start()
 
         print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
-        # Передаем NumPy массив напрямую в C++!
-        solver_manager = SolverManager(NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer, request_queue, result_array_wrapper.array, log_queue)
+        solver_manager = SolverManager(
+            num_workers=NUM_CPP_WORKERS, 
+            action_limit=ACTION_LIMIT, 
+            policy_buffer=policy_buffer, 
+            value_buffer=value_buffer, 
+            request_queue=request_queue, 
+            result_array=result_array, 
+            log_queue=log_queue,
+            first_street_candidates=FIRST_STREET_CANDIDATES,
+            max_pending_requests=MAX_PENDING_REQUESTS
+        )
         solver_manager.start()
         print("C++ workers are running in the background.", flush=True)
         
@@ -471,7 +459,6 @@ def main():
 
         try:
             while True:
-                # ... (основной цикл остается почти таким же, но без result_dict и cleanup) ...
                 if time.time() - last_stats_time > STATS_INTERVAL_SECONDS:
                     while not log_queue.empty():
                         try: print(log_queue.get(timeout=0.01), flush=True)
@@ -527,8 +514,6 @@ def main():
                 v_infosets = torch.from_numpy(v_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
                 v_targets = torch.from_numpy(v_targets_np).unsqueeze(1).to(device)
                 v_targets_clipped = torch.clamp(v_targets, -VALUE_CLIP_VALUE, VALUE_CLIP_VALUE)
-                pred_values = model(v_infosets)
-                loss_v = F.huber_loss(pred_values, v_targets_clipped, delta=1.0)
                 
                 p_infosets = torch.from_numpy(p_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
                 p_actions = torch.from_numpy(p_actions_np).to(device)
@@ -539,7 +524,12 @@ def main():
                 p_advantages_normalized = p_advantages_normalized.unsqueeze(1)
 
                 p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-                pred_logits, _ = model(p_infosets, p_actions, p_street_vector)
+                
+                # --- Оптимизированный forward pass ---
+                pred_logits, pred_values_for_policy = model(p_infosets, p_actions, p_street_vector)
+                pred_values_for_value = model(v_infosets)
+                
+                loss_v = F.huber_loss(pred_values_for_value, v_targets_clipped, delta=1.0)
                 loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
 
                 optimizer.zero_grad()
@@ -560,7 +550,7 @@ def main():
                         aim_run.track(float(v_targets.std()), name="targets/value_raw/std", step=global_step)
                         aim_run.track(float(p_advantages.std()), name="targets/advantage_raw/std", step=global_step)
                         var_t = float(torch.var(v_targets_clipped))
-                        ev = 1.0 - float(torch.var(v_targets_clipped - pred_values)) / max(var_t, 1e-6)
+                        ev = 1.0 - float(torch.var(v_targets_clipped - pred_values_for_value)) / max(var_t, 1e-6)
                         aim_run.track(ev, name="diagnostics/value_explained_var", step=global_step)
 
                 is_first_save = (global_step >= FIRST_SAVE_STEP) and (last_save_step < FIRST_SAVE_STEP)
