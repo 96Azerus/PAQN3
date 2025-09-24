@@ -165,6 +165,65 @@ def get_params_for_optimizer(model, base_lr, weight_decay, head_lr_mult=2.0, hea
         {'params': params_head_no_decay, 'weight_decay': 0.0, 'lr': base_lr * head_lr_mult},
     ]
 
+# --- ИЗМЕНЕНИЕ: Новая функция для инкапсуляции логики загрузки/инициализации модели ---
+def initialize_model_and_state(model, optimizer, device, auth_repo_url):
+    """
+    Надежно загружает состояние модели и оптимизатора.
+    Логика:
+    1. Сначала пытается загрузить модель из локального пути `MODEL_PATH`.
+    2. Если локальной модели нет, пытается скачать ее с GitHub (`git pull`).
+    3. Если после `git pull` модель появилась, загружает ее.
+    4. Если модели все еще нет, инициализирует новую модель с нуля и СОХРАНЯЕТ ее,
+       чтобы дочерние процессы могли ее найти при старте.
+    """
+    model_version, global_step = 0, 0
+    
+    # Шаг 1: Проверяем наличие локальной модели
+    if os.path.exists(MODEL_PATH):
+        print(f"Found local model at {MODEL_PATH}. Loading...")
+        try:
+            state_dict = torch.load(MODEL_PATH, map_location=device)
+            model.load_state_dict(state_dict['model_state_dict'])
+            optimizer.load_state_dict(state_dict['optimizer_state_dict'])
+            global_step = state_dict.get('global_step', 0)
+            model_version = state_dict.get('model_version', 0)
+            print(f"Loaded model, optimizer, and state. Resuming from step {global_step}, version {model_version}")
+            return model_version, global_step
+        except Exception as e:
+            print(f"FATAL: Local model file is corrupted. Error: {e}")
+            print("Please delete the file to start from scratch.")
+            sys.exit(1)
+
+    # Шаг 2: Локальной модели нет, пытаемся скачать с GitHub
+    print("Local model not found. Attempting to pull from GitHub...")
+    git_pull(project_root, auth_repo_url)
+    
+    # Шаг 3: Проверяем еще раз, не появилась ли модель после git pull
+    if os.path.exists(MODEL_PATH):
+        print("Model appeared after git pull. Loading...")
+        # Повторяем логику загрузки
+        return initialize_model_and_state(model, optimizer, device, auth_repo_url)
+
+    # Шаг 4: Модели все еще нет. Начинаем с нуля и сохраняем.
+    print("No model found locally or on GitHub. Starting training from scratch.")
+    print("--- Performing initial save of randomly initialized model ---")
+    try:
+        torch.save({
+            'global_step': 0,
+            'model_version': 0,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
+        }, MODEL_PATH)
+        with open(VERSION_FILE, 'w') as f:
+            f.write('0')
+        print("--- Initial model saved successfully. Workers can now start safely. ---")
+    except Exception as e:
+        print(f"FATAL: Could not save initial model: {e}")
+        sys.exit(1)
+        
+    return model_version, global_step
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
 class SharedNumpyArray:
     def __init__(self, shm, shape, dtype):
         self.shm = shm
@@ -208,12 +267,14 @@ class InferenceWorker(mp.Process):
 
     def _load_models(self):
         try:
+            # --- ИЗМЕНЕНИЕ: Теперь этот блок не должен падать, т.к. главный процесс гарантирует наличие файла ---
             if os.path.exists(MODEL_PATH):
                 state_dict = torch.load(MODEL_PATH, map_location=self.device)
                 self.latest_model.load_state_dict(state_dict.get('model_state_dict', state_dict))
                 self.model_version = state_dict.get('model_version', -1)
                 self._log(f"Loaded latest model (version {self.model_version}).")
             else:
+                # Эта ветка больше не должна выполняться, но оставляем как защиту
                 self._log(f"FATAL: No latest model found at {MODEL_PATH}. Worker cannot start.")
                 os._exit(1)
         except Exception as e:
@@ -261,7 +322,6 @@ class InferenceWorker(mp.Process):
 
         groups = defaultdict(list)
         for req in batch:
-            # Новый формат запроса: (req_id, infoset, action_vectors, is_traverser_turn, is_filter)
             is_traverser_turn = req[3]
             model_key = 'latest' if is_traverser_turn else 'opponent'
             groups[model_key].append(req)
@@ -272,28 +332,19 @@ class InferenceWorker(mp.Process):
                 
                 infosets = torch.tensor([r[1] for r in reqs], dtype=torch.float32, device=self.device).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                 
-                # Сначала прогоняем все через тело сети
                 body_outputs = model.forward_body(infosets)
-                
-                # Затем вычисляем value для всех
                 values = model.forward_value_head(body_outputs)
 
-                # Разделяем запросы на те, которым нужна только оценка (value), и те, которым нужна и политика
                 policy_req_indices = [i for i, r in enumerate(reqs) if r[2] is not None]
                 
-                # Записываем результаты для всех запросов
                 for i, req in enumerate(reqs):
                     req_id = req[0]
                     self.result_array[req_id, 0] = values[i].item()
-                    # Если политика не нужна, ставим флаг готовности
                     if i not in policy_req_indices:
                         self.result_array[req_id, 1] = 1
 
-                # Если есть запросы на политику, обрабатываем их
                 if policy_req_indices:
-                    # Собираем все векторы действий в один большой батч
-                    action_vectors = []
-                    splits = []
+                    action_vectors, splits = [], []
                     for i in policy_req_indices:
                         action_vecs_for_req = reqs[i][2]
                         action_vectors.extend(action_vecs_for_req)
@@ -301,7 +352,6 @@ class InferenceWorker(mp.Process):
 
                     action_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
                     
-                    # Повторяем body_outputs и infosets в соответствии с количеством действий
                     policy_body_outputs = body_outputs[policy_req_indices]
                     policy_infosets = infosets[policy_req_indices]
                     
@@ -312,7 +362,6 @@ class InferenceWorker(mp.Process):
                     street_tensor = repeated_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
                     
                     logits = model.forward_policy_head(repeated_body_outputs, action_tensor, street_tensor)
-                    
                     results_flat = logits.cpu().numpy().flatten()
                     
                     current_pos = 0
@@ -320,9 +369,8 @@ class InferenceWorker(mp.Process):
                         req_idx_in_batch = policy_req_indices[i]
                         req_id = reqs[req_idx_in_batch][0]
                         
-                        # Записываем результаты в общую память
                         self.result_array[req_id, 2:2+num_actions] = results_flat[current_pos : current_pos + num_actions]
-                        self.result_array[req_id, 1] = 1 # Флаг готовности
+                        self.result_array[req_id, 1] = 1
                         current_pos += num_actions
 
     def run(self):
@@ -374,18 +422,9 @@ def main():
         auth_repo_url = f"https://{git_username}:{git_token}@github.com/{GIT_REPO_OWNER}/{GIT_REPO_NAME}.git"
         run_git_command(["git", "config", "--global", "user.email", f"{git_username}@users.noreply.github.com"], project_root)
         run_git_command(["git", "config", "--global", "user.name", git_username], project_root)
-        git_pull(project_root, auth_repo_url)
         
         os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
         os.makedirs(LOCAL_OPPONENT_POOL_DIR, exist_ok=True)
-        GIT_OPPONENT_POOL_DIR = os.path.join(project_root, "opponent_pool")
-        if os.path.exists(GIT_OPPONENT_POOL_DIR):
-            print("Syncing opponent pool from Git...")
-            for f in glob.glob(os.path.join(GIT_OPPONENT_POOL_DIR, "*.pth")): shutil.copy2(f, LOCAL_OPPONENT_POOL_DIR)
-            print(f"Synced {len(os.listdir(LOCAL_OPPONENT_POOL_DIR))} opponents.")
-
-        GIT_MODEL_PATH = os.path.join(project_root, "paqn_model_latest.pth")
-        if os.path.exists(GIT_MODEL_PATH) and not os.path.exists(MODEL_PATH): shutil.copy2(GIT_MODEL_PATH, MODEL_PATH)
         
         print("Initializing C++ hand evaluator lookup tables...", flush=True); initialize_evaluator()
         print("C++ evaluator initialized successfully.", flush=True)
@@ -395,23 +434,16 @@ def main():
         optimizer_grouped_parameters = get_params_for_optimizer(model, LEARNING_RATE, weight_decay=0.01, head_lr_mult=2.0, head_wd=0.0)
         optimizer = optim.AdamW(optimizer_grouped_parameters)
         
-        model_version, global_step = 0, 0
-        if os.path.exists(MODEL_PATH):
-            try:
-                state_dict = torch.load(MODEL_PATH, map_location=device)
-                model.load_state_dict(state_dict['model_state_dict'])
-                optimizer.load_state_dict(state_dict['optimizer_state_dict'])
-                global_step = state_dict.get('global_step', 0)
-                model_version = state_dict.get('model_version', 0)
-                print(f"Loaded model, optimizer, and state. Resuming from step {global_step}, version {model_version}")
-            except Exception as e:
-                print(f"FATAL: Model file found at {MODEL_PATH}, but failed to load.")
-                print(f"Error: {e}")
-                print("This is likely due to a corrupted file or a Git LFS issue.")
-                print("Please check the file or delete it to start from scratch.")
-                sys.exit(1)
-        else:
-            print("No model file found. Starting training from scratch.")
+        # --- ИЗМЕНЕНИЕ: Замена старого блока загрузки на вызов новой функции ---
+        model_version, global_step = initialize_model_and_state(model, optimizer, device, auth_repo_url)
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+        # Синхронизируем пул оппонентов ПОСЛЕ попытки git pull
+        GIT_OPPONENT_POOL_DIR = os.path.join(project_root, "opponent_pool")
+        if os.path.exists(GIT_OPPONENT_POOL_DIR):
+            print("Syncing opponent pool from Git...")
+            for f in glob.glob(os.path.join(GIT_OPPONENT_POOL_DIR, "*.pth")): shutil.copy2(f, LOCAL_OPPONENT_POOL_DIR)
+            print(f"Synced {len(os.listdir(LOCAL_OPPONENT_POOL_DIR))} opponents.")
 
         head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "2000"))
         if global_step < head_warmup_steps:
@@ -525,8 +557,7 @@ def main():
 
                 p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
                 
-                # --- Оптимизированный forward pass ---
-                pred_logits, pred_values_for_policy = model(p_infosets, p_actions, p_street_vector)
+                pred_logits, _ = model(p_infosets, p_actions, p_street_vector)
                 pred_values_for_value = model(v_infosets)
                 
                 loss_v = F.huber_loss(pred_values_for_value, v_targets_clipped, delta=1.0)
