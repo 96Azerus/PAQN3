@@ -14,7 +14,7 @@
 #include <unordered_map>
 #include <array>
 #include <cstdint>
-#include <functional> // <--- ДОБАВЬТЕ ЭТУ СТРОКУ
+#include <functional>
 
 namespace omp {
 
