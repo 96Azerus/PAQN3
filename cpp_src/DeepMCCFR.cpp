@@ -15,8 +15,6 @@
 
 namespace ofc {
 
-// ... (константы и action_to_vector без изменений) ...
-const size_t FIRST_STREET_CANDIDATES = 2000;
 const size_t FIRST_STREET_ACTION_LIMIT = 100;
 const size_t FIRST_STREET_RANDOM_EXPLORE = 5;
 
@@ -61,19 +59,20 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
 
 std::atomic<uint64_t> DeepMCCFR::request_id_counter_{0};
 
-DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
+DeepMCCFR::DeepMCCFR(size_t action_limit, size_t first_street_candidates, size_t max_pending_requests,
+                     SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, 
-                     // === ИЗМЕНЕНИЕ: Принимаем указатель на массив и его ширину ===
                      float* result_array, size_t result_row_size,
                      LogQueue* log_queue) 
     : policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       request_queue_(request_queue),
-      // === ИЗМЕНЕНИЕ: Инициализируем новые члены класса ===
       result_array_(result_array),
       result_row_size_(result_row_size),
       log_queue_(log_queue),
       action_limit_(action_limit),
+      first_street_candidates_(first_street_candidates),
+      max_pending_requests_(max_pending_requests),
       rng_(std::random_device{}()),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
@@ -85,7 +84,6 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true);
 }
 
-// ... (featurize_state_cpp без изменений) ...
 std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
     std::vector<float> features(INFOSET_SIZE, 0.0f);
     const int P_BOARD_TOP = 0, P_BOARD_MID = 1, P_BOARD_BOT = 2, P_HAND = 3;
@@ -145,10 +143,9 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int current_player = state.get_current_player();
     std::vector<Action> legal_actions;
     
-    // ... (логика выбора действий остается без изменений) ...
     if (state.get_street() == 1) {
         std::vector<Action> candidates;
-        state.get_first_street_candidates(FIRST_STREET_CANDIDATES, candidates, rng_);
+        state.get_first_street_candidates(first_street_candidates_, candidates, rng_);
         
         if (candidates.size() <= FIRST_STREET_ACTION_LIMIT) {
             legal_actions = candidates;
@@ -171,26 +168,28 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                 canonical_action_vectors_filter.push_back(action_to_vector(canonical_action));
             }
 
-            // === ИЗМЕНЕНИЕ: Используем кольцевой буфер для ID запросов ===
-            uint64_t filter_request_id = (request_id_counter_++) % MAX_PENDING_REQUESTS;
+            uint64_t filter_request_id = (request_id_counter_++) % max_pending_requests_;
             
             {
                 py::gil_scoped_acquire acquire;
+                // Новый формат запроса: (req_id, infoset, action_vectors, is_traverser_turn, is_filter)
                 py::tuple filter_request = py::make_tuple(
-                    filter_request_id, true, py::cast(infoset_vec_filter), 
-                    py::cast(canonical_action_vectors_filter), py::bool_(true), py::bool_(true)
+                    filter_request_id, 
+                    py::cast(infoset_vec_filter), 
+                    py::cast(canonical_action_vectors_filter), 
+                    py::bool_(true), // is_traverser_turn
+                    py::bool_(true)  // is_filter
                 );
                 request_queue_->attr("put")(filter_request);
             }
 
             std::vector<float> logits;
-            // === ИЗМЕНЕНИЕ: Ждем результат в общей памяти ===
             while(result_array_[filter_request_id * result_row_size_ + 1] == 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             logits.assign(&result_array_[filter_request_id * result_row_size_ + 2], 
                           &result_array_[filter_request_id * result_row_size_ + 2 + candidates.size()]);
-            result_array_[filter_request_id * result_row_size_ + 1] = 0; // Сбрасываем флаг
+            result_array_[filter_request_id * result_row_size_ + 1] = 0;
 
             std::vector<size_t> indices(candidates.size());
             std::iota(indices.begin(), indices.end(), 0);
@@ -255,25 +254,20 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
-    // === ИЗМЕНЕНИЕ: Используем кольцевой буфер для ID запросов ===
-    uint64_t policy_request_id = (request_id_counter_++) % MAX_PENDING_REQUESTS;
-    uint64_t value_request_id = (request_id_counter_++) % MAX_PENDING_REQUESTS;
-
+    uint64_t request_id = (request_id_counter_++) % max_pending_requests_;
     bool is_traverser_turn = (current_player == traversing_player);
 
     {
         py::gil_scoped_acquire acquire;
-        py::tuple policy_request_tuple = py::make_tuple(
-            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors), 
-            py::bool_(is_traverser_turn), py::bool_(false)
+        // Новый унифицированный формат запроса
+        py::tuple request_tuple = py::make_tuple(
+            request_id, 
+            py::cast(infoset_vec), 
+            py::cast(canonical_action_vectors), 
+            py::bool_(is_traverser_turn),
+            py::bool_(false) // is_filter
         );
-        request_queue_->attr("put")(policy_request_tuple);
-
-        py::tuple value_request_tuple = py::make_tuple(
-            value_request_id, false, py::cast(infoset_vec), py::none(), 
-            py::bool_(is_traverser_turn), py::bool_(false)
-        );
-        request_queue_->attr("put")(value_request_tuple);
+        request_queue_->attr("put")(request_tuple);
     }
 
     std::vector<float> logits;
@@ -282,15 +276,12 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     auto start_time = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::seconds(30);
 
-    // === ИЗМЕНЕНИЕ: Ждем оба результата в общей памяти ===
-    while(result_array_[policy_request_id * result_row_size_ + 1] == 0 ||
-          result_array_[value_request_id * result_row_size_ + 1] == 0) {
+    while(result_array_[request_id * result_row_size_ + 1] == 0) {
         if (std::chrono::steady_clock::now() - start_time > timeout) {
             {
                 py::gil_scoped_acquire acquire;
                 std::stringstream ss;
-                ss << "[C++ WORKER TIMEOUT] Waiting for inference results timed out. Req IDs: " 
-                   << policy_request_id << ", " << value_request_id;
+                ss << "[C++ WORKER TIMEOUT] Waiting for inference result timed out. Req ID: " << request_id;
                 log_queue_->attr("put")(py::str(ss.str()));
             }
             return {{0, 0.0f}, {1, 0.0f}};
@@ -298,15 +289,12 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    logits.assign(&result_array_[policy_request_id * result_row_size_ + 2], 
-                  &result_array_[policy_request_id * result_row_size_ + 2 + num_actions]);
-    value_baseline = result_array_[value_request_id * result_row_size_ + 0];
+    value_baseline = result_array_[request_id * result_row_size_ + 0];
+    logits.assign(&result_array_[request_id * result_row_size_ + 2], 
+                  &result_array_[request_id * result_row_size_ + 2 + num_actions]);
+    
+    result_array_[request_id * result_row_size_ + 1] = 0;
 
-    // Сбрасываем флаги
-    result_array_[policy_request_id * result_row_size_ + 1] = 0;
-    result_array_[value_request_id * result_row_size_ + 1] = 0;
-
-    // ... (остальная логика traverse без изменений) ...
     std::vector<float> strategy(num_actions);
     if (!logits.empty() && logits.size() == num_actions) {
         float max_logit = -std::numeric_limits<float>::infinity();
