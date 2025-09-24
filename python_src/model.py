@@ -124,15 +124,17 @@ class OFC_CNN_Network(nn.Module):
     def forward(self, state_image, action_vec=None, street_vector=None):
         body_out = self.forward_body(state_image)
         
+        # Если action_vec не предоставлен, это запрос только на value.
         if action_vec is None:
-            # Value only
             value = self.forward_value_head(body_out)
             return value
         
-        # Policy
+        # Если action_vec предоставлен, это запрос на policy.
+        # Для эффективности мы также вернем value, так как body_out уже вычислен.
         if street_vector is None:
             raise ValueError("street_vector must be provided for policy evaluation")
             
         policy_logit = self.forward_policy_head(body_out, action_vec, street_vector)
+        value = self.forward_value_head(body_out)
         
-        return policy_logit, None
+        return policy_logit, value
