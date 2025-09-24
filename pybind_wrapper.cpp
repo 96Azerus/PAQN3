@@ -15,29 +15,28 @@
 
 namespace py = pybind11;
 
-// === ИЗМЕНЕНИЕ: Константа для размера буфера результатов, должна совпадать с Python ===
-constexpr size_t MAX_PENDING_REQUESTS = 200 * 4; // NUM_CPP_WORKERS * 4
-
 class SolverManagerImpl {
 public:
     SolverManagerImpl(
         size_t num_workers,
         size_t action_limit,
+        size_t first_street_candidates,
+        size_t max_pending_requests,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        // === ИЗМЕНЕНИЕ: Принимаем NumPy массив вместо Python объекта ===
         py::array_t<float> result_array,
         py::object log_queue
     ) : num_workers_(num_workers),
         action_limit_(action_limit),
+        first_street_candidates_(first_street_candidates),
+        max_pending_requests_(max_pending_requests),
         policy_buffer_(policy_buffer),
         value_buffer_(value_buffer),
         request_queue_(request_queue), 
         log_queue_(log_queue) 
     {
         stop_flag_.store(true);
-        // Получаем прямой указатель на данные и размеры массива
         py::buffer_info buf_info = result_array.request();
         result_array_ptr_ = static_cast<float*>(buf_info.ptr);
         result_row_size_ = buf_info.shape[1];
@@ -53,9 +52,14 @@ public:
         }
         for (size_t i = 0; i < num_workers_; ++i) {
             auto solver = std::make_unique<ofc::DeepMCCFR>(
-                action_limit_, policy_buffer_, value_buffer_, &request_queue_, 
-                // Передаем указатель и размер в каждый воркер
-                result_array_ptr_, result_row_size_,
+                action_limit_, 
+                first_street_candidates_,
+                max_pending_requests_,
+                policy_buffer_, 
+                value_buffer_, 
+                &request_queue_, 
+                result_array_ptr_, 
+                result_row_size_,
                 &log_queue_
             );
             threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
@@ -82,6 +86,8 @@ private:
 
     size_t num_workers_;
     size_t action_limit_;
+    size_t first_street_candidates_;
+    size_t max_pending_requests_;
     ofc::SharedReplayBuffer* policy_buffer_;
     ofc::SharedReplayBuffer* value_buffer_;
 
@@ -90,7 +96,6 @@ private:
     py::object request_queue_;
     py::object log_queue_;
     
-    // === ИЗМЕНЕНИЕ: Храним указатель на данные NumPy массива ===
     float* result_array_ptr_;
     size_t result_row_size_;
 };
@@ -100,16 +105,17 @@ public:
     PySolverManager(
         size_t num_workers,
         size_t action_limit,
+        size_t first_street_candidates,
+        size_t max_pending_requests,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        // === ИЗМЕНЕНИЕ: Принимаем NumPy массив ===
         py::array_t<float> result_array,
         py::object log_queue
     ) {
         impl_ = std::make_unique<SolverManagerImpl>(
-            num_workers, action_limit, policy_buffer, value_buffer,
-            request_queue, result_array, log_queue
+            num_workers, action_limit, first_street_candidates, max_pending_requests,
+            policy_buffer, value_buffer, request_queue, result_array, log_queue
         );
     }
 
@@ -178,12 +184,14 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::array_t<float>, py::object>(),
+        .def(py::init<size_t, size_t, size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::array_t<float>, py::object>(),
              py::arg("num_workers"),
              py::arg("action_limit"),
-             py::arg("policy_buffer"), py::arg("value_buffer"),
+             py::arg("first_street_candidates"),
+             py::arg("max_pending_requests"),
+             py::arg("policy_buffer"), 
+             py::arg("value_buffer"),
              py::arg("request_queue"), 
-             // === ИЗМЕНЕНИЕ: Указываем, что 6-й аргумент - это NumPy массив ===
              py::arg("result_array"),
              py::arg("log_queue")
         )
