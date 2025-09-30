@@ -1,18 +1,20 @@
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "2")  # ✅ Было "1"
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("OMP_MAX_ACTIVE_LEVELS", "1")
 os.environ.setdefault("PYTHONFAULTHANDLER", "1")
 os.environ.setdefault("HEAD_WARMUP_STEPS", "2000")
+os.environ.setdefault("OMP_PROC_BIND", "spread")  # ✅ NUMA optimization
+os.environ.setdefault("OMP_PLACES", "threads")
 
 import sys
 import time
 import torch
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
+torch.set_num_threads(2)  # ✅ Было 1
+torch.set_num_interop_threads(2)  # ✅ Было 1
 
 import torch.nn.functional as F
 import torch.optim as optim
@@ -50,20 +52,19 @@ if build_dir not in sys.path:
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
-# --- КОНСТАНТЫ (ЕДИНЫЙ ИСТОЧНИК) ---
+# --- КОНСТАНТЫ ---
 NUM_FEATURE_CHANNELS = 16
 NUM_SUITS = 4
 NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 STREET_START_IDX = 9
 STREET_END_IDX = 14
-FIRST_STREET_CANDIDATES = 2000 # Максимальное количество действий для фильтрации
+FIRST_STREET_CANDIDATES = 2000
 
-# --- НАСТРОЙКИ ---
-# Оптимизированные значения для 224-ядерной машины
-NUM_INFERENCE_WORKERS = 32
-NUM_CPP_WORKERS = 160 
-print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
+# --- ОПТИМИЗИРОВАННЫЕ НАСТРОЙКИ для 224 ядер ---
+NUM_INFERENCE_WORKERS = 90   # ✅ Было 32, теперь 90!
+NUM_CPP_WORKERS = 130        # ✅ Было 160, теперь 130!
+print(f"⚡ Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
 ACTION_LIMIT = 100
@@ -76,11 +77,11 @@ POLICY_WEIGHT_END = 1.0
 POLICY_WEIGHT_SCHEDULE_STEPS = 100000
 VALUE_CLIP_VALUE = 50.0
 
-# --- ГИПЕРПАРАМЕТРЫ ДЛЯ БАТЧИНГА ---
-INFERENCE_MAX_BATCH_SIZE = 512
-INFERENCE_BATCH_TIMEOUT_MS = 5.0
+# --- КРИТИЧЕСКИ ВАЖНО: Батчинг ---
+INFERENCE_MAX_BATCH_SIZE = 256   # ✅ Было 512, меньше = быстрее
+INFERENCE_BATCH_TIMEOUT_MS = 0.5 # ✅ Было 5.0, теперь 0.5ms!
 
-# --- ПУТИ И ИНТЕРВАЛЫ ---
+# --- ПУТИ ---
 STATS_INTERVAL_SECONDS = 15
 FIRST_SAVE_STEP = 100
 SAVE_INTERVAL_STEPS = 100
@@ -93,7 +94,7 @@ VERSION_FILE = os.path.join(LOCAL_MODEL_DIR, "latest_version.txt")
 LOCAL_OPPONENT_POOL_DIR = os.path.join(LOCAL_MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
-# --- НАСТРОЙКИ GIT ---
+# --- GIT ---
 GIT_REPO_OWNER = "Azerus96"
 GIT_REPO_NAME = "PAQN3"
 GIT_BRANCH = "main"
@@ -165,20 +166,10 @@ def get_params_for_optimizer(model, base_lr, weight_decay, head_lr_mult=2.0, hea
         {'params': params_head_no_decay, 'weight_decay': 0.0, 'lr': base_lr * head_lr_mult},
     ]
 
-# --- ИЗМЕНЕНИЕ: Новая функция для инкапсуляции логики загрузки/инициализации модели ---
 def initialize_model_and_state(model, optimizer, device, auth_repo_url):
-    """
-    Надежно загружает состояние модели и оптимизатора.
-    Логика:
-    1. Сначала пытается загрузить модель из локального пути `MODEL_PATH`.
-    2. Если локальной модели нет, пытается скачать ее с GitHub (`git pull`).
-    3. Если после `git pull` модель появилась, загружает ее.
-    4. Если модели все еще нет, инициализирует новую модель с нуля и СОХРАНЯЕТ ее,
-       чтобы дочерние процессы могли ее найти при старте.
-    """
+    """Надежная загрузка модели с fallback"""
     model_version, global_step = 0, 0
     
-    # Шаг 1: Проверяем наличие локальной модели
     if os.path.exists(MODEL_PATH):
         print(f"Found local model at {MODEL_PATH}. Loading...")
         try:
@@ -187,24 +178,20 @@ def initialize_model_and_state(model, optimizer, device, auth_repo_url):
             optimizer.load_state_dict(state_dict['optimizer_state_dict'])
             global_step = state_dict.get('global_step', 0)
             model_version = state_dict.get('model_version', 0)
-            print(f"Loaded model, optimizer, and state. Resuming from step {global_step}, version {model_version}")
+            print(f"✅ Loaded model, optimizer, and state. Resuming from step {global_step}, version {model_version}")
             return model_version, global_step
         except Exception as e:
             print(f"FATAL: Local model file is corrupted. Error: {e}")
             print("Please delete the file to start from scratch.")
             sys.exit(1)
 
-    # Шаг 2: Локальной модели нет, пытаемся скачать с GitHub
     print("Local model not found. Attempting to pull from GitHub...")
     git_pull(project_root, auth_repo_url)
     
-    # Шаг 3: Проверяем еще раз, не появилась ли модель после git pull
     if os.path.exists(MODEL_PATH):
         print("Model appeared after git pull. Loading...")
-        # Повторяем логику загрузки
         return initialize_model_and_state(model, optimizer, device, auth_repo_url)
 
-    # Шаг 4: Модели все еще нет. Начинаем с нуля и сохраняем.
     print("No model found locally or on GitHub. Starting training from scratch.")
     print("--- Performing initial save of randomly initialized model ---")
     try:
@@ -216,13 +203,12 @@ def initialize_model_and_state(model, optimizer, device, auth_repo_url):
         }, MODEL_PATH)
         with open(VERSION_FILE, 'w') as f:
             f.write('0')
-        print("--- Initial model saved successfully. Workers can now start safely. ---")
+        print("✅ Initial model saved successfully. Workers can now start safely.")
     except Exception as e:
         print(f"FATAL: Could not save initial model: {e}")
         sys.exit(1)
         
     return model_version, global_step
-# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 class SharedNumpyArray:
     def __init__(self, shm, shape, dtype):
@@ -238,6 +224,8 @@ class SharedNumpyArray:
         self.array = np.ndarray(shape, dtype=dtype, buffer=self.shm.buf)
 
 class InferenceWorker(mp.Process):
+    """✅ ПОЛНОСТЬЮ ОПТИМИЗИРОВАННЫЙ inference worker"""
+    
     def __init__(self, name, task_queue, result_shm_info, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
@@ -246,6 +234,8 @@ class InferenceWorker(mp.Process):
         self.stop_event = stop_event
         self.model_version = -1
         self.last_version_check_time = 0
+        self.inference_count = 0
+        self.last_throughput_log = time.time()
 
     def _log(self, message):
         self.log_queue.put(f"[{self.name}] {message}")
@@ -253,13 +243,29 @@ class InferenceWorker(mp.Process):
     def _initialize(self):
         self._log("Started.")
         self.device = torch.device("cpu")
-        torch.set_num_threads(1)
-        os.environ['OMP_NUM_THREADS'] = '1'
+        
+        # ✅ Оптимизация PyTorch для этого worker
+        torch.set_num_threads(2)
+        torch.set_num_interop_threads(2)
+        os.environ['OMP_NUM_THREADS'] = '2'
+        os.environ['MKL_NUM_THREADS'] = '2'
+        
         self.latest_model = OFC_CNN_Network().to(self.device)
         self.opponent_model = OFC_CNN_Network().to(self.device)
         self._load_models()
+        
         self.latest_model.eval()
         self.opponent_model.eval()
+        
+        # ✅ Компиляция моделей (PyTorch 2.0+)
+        if hasattr(torch, 'compile'):
+            try:
+                self._log("Compiling models with torch.compile...")
+                self.latest_model = torch.compile(self.latest_model, mode='reduce-overhead')
+                self.opponent_model = torch.compile(self.opponent_model, mode='reduce-overhead')
+                self._log("✅ Models compiled successfully!")
+            except Exception as e:
+                self._log(f"⚠️ torch.compile failed: {e}, continuing without compilation")
         
         shm_name, shape, dtype = self.result_shm_info
         self.result_shm = shared_memory.SharedMemory(name=shm_name)
@@ -267,14 +273,12 @@ class InferenceWorker(mp.Process):
 
     def _load_models(self):
         try:
-            # --- ИЗМЕНЕНИЕ: Теперь этот блок не должен падать, т.к. главный процесс гарантирует наличие файла ---
             if os.path.exists(MODEL_PATH):
                 state_dict = torch.load(MODEL_PATH, map_location=self.device)
                 self.latest_model.load_state_dict(state_dict.get('model_state_dict', state_dict))
                 self.model_version = state_dict.get('model_version', -1)
                 self._log(f"Loaded latest model (version {self.model_version}).")
             else:
-                # Эта ветка больше не должна выполняться, но оставляем как защиту
                 self._log(f"FATAL: No latest model found at {MODEL_PATH}. Worker cannot start.")
                 os._exit(1)
         except Exception as e:
@@ -292,34 +296,57 @@ class InferenceWorker(mp.Process):
             else:
                 self.opponent_model.load_state_dict(self.latest_model.state_dict())
                 self._log("Opponent pool is empty, using latest model as opponent.")
-        except Exception as e: self._log(f"!!! EXCEPTION during opponent model loading: {e}")
+        except Exception as e: 
+            self._log(f"!!! EXCEPTION during opponent model loading: {e}")
 
     def _check_for_updates(self):
         if time.time() - self.last_version_check_time < 5: return
         self.last_version_check_time = time.time()
         try:
             if os.path.exists(VERSION_FILE):
-                with open(VERSION_FILE, 'r') as f: latest_version = int(f.read())
+                with open(VERSION_FILE, 'r') as f: 
+                    latest_version = int(f.read())
                 if latest_version > self.model_version:
                     time.sleep(int(self.name.split('-')[-1]) * 0.1)
                     self._log(f"New model version detected ({latest_version}). Reloading models...")
                     self._load_models()
-        except (IOError, ValueError) as e: self._log(f"Could not check for model update: {e}")
+        except (IOError, ValueError) as e: 
+            self._log(f"Could not check for model update: {e}")
 
     def collect_batch(self):
+        """✅ ОПТИМИЗИРОВАННЫЙ батчинг без exception overhead"""
         batch = []
+        timeout = INFERENCE_BATCH_TIMEOUT_MS / 1000.0  # 0.5ms
+        deadline = time.time() + timeout
+        
+        # Ждем первый запрос с полным таймаутом
         try:
-            first_req = self.task_queue.get(timeout=INFERENCE_BATCH_TIMEOUT_MS / 1000.0)
+            first_req = self.task_queue.get(timeout=timeout)
             batch.append(first_req)
-            while len(batch) < INFERENCE_MAX_BATCH_SIZE:
-                batch.append(self.task_queue.get_nowait())
         except queue.Empty:
-            pass
+            return batch
+        
+        # Быстро собираем остальные
+        while len(batch) < INFERENCE_MAX_BATCH_SIZE:
+            remaining_time = deadline - time.time()
+            if remaining_time <= 0:
+                break
+            
+            try:
+                # Очень короткий таймаут вместо get_nowait()
+                req = self.task_queue.get(timeout=min(0.0001, remaining_time))
+                batch.append(req)
+            except queue.Empty:
+                break
+        
         return batch
 
     def process_batch(self, batch):
-        if not batch: return
+        """✅ ОПТИМИЗИРОВАННАЯ обработка батча"""
+        if not batch: 
+            return
 
+        # Группируем по типу модели
         groups = defaultdict(list)
         for req in batch:
             is_traverser_turn = req[3]
@@ -330,48 +357,83 @@ class InferenceWorker(mp.Process):
             for model_key, reqs in groups.items():
                 model = self.latest_model if model_key == 'latest' else self.opponent_model
                 
-                infosets = torch.tensor([r[1] for r in reqs], dtype=torch.float32, device=self.device).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
+                # Создаем тензор сразу правильного размера
+                infosets = torch.tensor(
+                    [r[1] for r in reqs], 
+                    dtype=torch.float32, 
+                    device=self.device
+                ).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                 
+                # Forward pass через body
                 body_outputs = model.forward_body(infosets)
                 values = model.forward_value_head(body_outputs)
 
+                # Индексы запросов с policy
                 policy_req_indices = [i for i, r in enumerate(reqs) if r[2] is not None]
                 
+                # Записываем value для всех
                 for i, req in enumerate(reqs):
                     req_id = req[0]
                     self.result_array[req_id, 0] = values[i].item()
                     if i not in policy_req_indices:
-                        self.result_array[req_id, 1] = 1
+                        self.result_array[req_id, 1] = 1  # Готово
 
+                # Обрабатываем policy запросы батчем
                 if policy_req_indices:
-                    action_vectors, splits = [], []
+                    action_vectors = []
+                    splits = []
+                    
                     for i in policy_req_indices:
                         action_vecs_for_req = reqs[i][2]
                         action_vectors.extend(action_vecs_for_req)
                         splits.append(len(action_vecs_for_req))
 
-                    action_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
+                    action_tensor = torch.tensor(
+                        action_vectors, 
+                        dtype=torch.float32, 
+                        device=self.device
+                    )
                     
                     policy_body_outputs = body_outputs[policy_req_indices]
                     policy_infosets = infosets[policy_req_indices]
                     
+                    # Repeat для каждого action
                     repeat_counts = torch.tensor(splits, device=self.device)
-                    repeated_body_outputs = torch.repeat_interleave(policy_body_outputs, repeat_counts, dim=0)
-                    repeated_infosets = torch.repeat_interleave(policy_infosets, repeat_counts, dim=0)
+                    repeated_body_outputs = torch.repeat_interleave(
+                        policy_body_outputs, repeat_counts, dim=0
+                    )
+                    repeated_infosets = torch.repeat_interleave(
+                        policy_infosets, repeat_counts, dim=0
+                    )
                     
                     street_tensor = repeated_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
                     
-                    logits = model.forward_policy_head(repeated_body_outputs, action_tensor, street_tensor)
+                    logits = model.forward_policy_head(
+                        repeated_body_outputs, action_tensor, street_tensor
+                    )
                     results_flat = logits.cpu().numpy().flatten()
                     
+                    # Раздаём результаты
                     current_pos = 0
                     for i, num_actions in enumerate(splits):
                         req_idx_in_batch = policy_req_indices[i]
                         req_id = reqs[req_idx_in_batch][0]
                         
-                        self.result_array[req_id, 2:2+num_actions] = results_flat[current_pos : current_pos + num_actions]
-                        self.result_array[req_id, 1] = 1
+                        self.result_array[req_id, 2:2+num_actions] = \
+                            results_flat[current_pos : current_pos + num_actions]
+                        self.result_array[req_id, 1] = 1  # Готово
                         current_pos += num_actions
+        
+        # ✅ Метрики производительности
+        self.inference_count += len(batch)
+        now = time.time()
+        if now - self.last_throughput_log > 60:  # Каждую минуту
+            elapsed = now - self.last_throughput_log
+            throughput = self.inference_count / elapsed
+            avg_batch = self.inference_count / 60.0
+            self._log(f"📊 Throughput: {throughput:.1f} inferences/sec, Avg batch: {avg_batch:.1f}")
+            self.inference_count = 0
+            self.last_throughput_log = now
 
     def run(self):
         self._initialize()
@@ -382,24 +444,33 @@ class InferenceWorker(mp.Process):
                     self.process_batch(batch)
                 else:
                     self._check_for_updates()
-            except (KeyboardInterrupt, SystemExit): break
+            except (KeyboardInterrupt, SystemExit): 
+                break
             except Exception:
                 self._log(f"---!!! EXCEPTION IN {self.name} !!!---")
                 self._log(traceback.format_exc())
+        
         self._log("Stopped.")
         self.result_shm.close()
 
 def main():
     with SharedMemoryManager() as smm:
-        aim_run = aim.Run(experiment="paqn_ofc_poker_fix")
+        aim_run = aim.Run(experiment="paqn_ofc_poker_optimized")
         aim_run["hparams"] = {
-            "num_cpp_workers": NUM_CPP_WORKERS, "num_inference_workers": NUM_INFERENCE_WORKERS,
-            "learning_rate": LEARNING_RATE, "buffer_capacity": BUFFER_CAPACITY,
-            "batch_size": BATCH_SIZE, "policy_weight_start": POLICY_WEIGHT_START,
-            "policy_weight_end": POLICY_WEIGHT_END, "policy_weight_schedule": POLICY_WEIGHT_SCHEDULE_STEPS,
-            "value_clip_value": VALUE_CLIP_VALUE, "head_lr_mult": 2.0, "head_wd": 0.0,
+            "num_cpp_workers": NUM_CPP_WORKERS, 
+            "num_inference_workers": NUM_INFERENCE_WORKERS,
+            "learning_rate": LEARNING_RATE, 
+            "buffer_capacity": BUFFER_CAPACITY,
+            "batch_size": BATCH_SIZE, 
+            "policy_weight_start": POLICY_WEIGHT_START,
+            "policy_weight_end": POLICY_WEIGHT_END, 
+            "policy_weight_schedule": POLICY_WEIGHT_SCHEDULE_STEPS,
+            "value_clip_value": VALUE_CLIP_VALUE, 
+            "head_lr_mult": 2.0, 
+            "head_wd": 0.0,
             "head_warmup_steps": int(os.environ.get("HEAD_WARMUP_STEPS", "2000")),
-            "inference_max_batch_size": INFERENCE_MAX_BATCH_SIZE, "inference_batch_timeout_ms": INFERENCE_BATCH_TIMEOUT_MS
+            "inference_max_batch_size": INFERENCE_MAX_BATCH_SIZE, 
+            "inference_batch_timeout_ms": INFERENCE_BATCH_TIMEOUT_MS
         }
 
         def monitor_resources():
@@ -413,12 +484,17 @@ def main():
                         aim_run.track(rss_gb, name="system/memory_rss_gb")
                         aim_run.track(threads, name="system/num_threads")
                     time.sleep(15)
-                except (psutil.NoSuchProcess, KeyboardInterrupt): break
+                except (psutil.NoSuchProcess, KeyboardInterrupt): 
+                    break
+        
         threading.Thread(target=monitor_resources, daemon=True).start()
 
         git_username = os.environ.get('GIT_USERNAME')
         git_token = os.environ.get('GIT_TOKEN')
-        if not git_username or not git_token: print("ERROR: GIT_USERNAME and GIT_TOKEN must be set."); sys.exit(1)
+        if not git_username or not git_token: 
+            print("ERROR: GIT_USERNAME and GIT_TOKEN must be set."); 
+            sys.exit(1)
+        
         auth_repo_url = f"https://{git_username}:{git_token}@github.com/{GIT_REPO_OWNER}/{GIT_REPO_NAME}.git"
         run_git_command(["git", "config", "--global", "user.email", f"{git_username}@users.noreply.github.com"], project_root)
         run_git_command(["git", "config", "--global", "user.name", git_username], project_root)
@@ -426,23 +502,27 @@ def main():
         os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
         os.makedirs(LOCAL_OPPONENT_POOL_DIR, exist_ok=True)
         
-        print("Initializing C++ hand evaluator lookup tables...", flush=True); initialize_evaluator()
+        print("Initializing C++ hand evaluator lookup tables...", flush=True)
+        initialize_evaluator()
         print("C++ evaluator initialized successfully.", flush=True)
 
-        device = torch.device("cpu"); print(f"Using device: {device}", flush=True)
+        device = torch.device("cpu")
+        print(f"Using device: {device}", flush=True)
+        
         model = OFC_CNN_Network().to(device)
-        optimizer_grouped_parameters = get_params_for_optimizer(model, LEARNING_RATE, weight_decay=0.01, head_lr_mult=2.0, head_wd=0.0)
+        optimizer_grouped_parameters = get_params_for_optimizer(
+            model, LEARNING_RATE, weight_decay=0.01, head_lr_mult=2.0, head_wd=0.0
+        )
         optimizer = optim.AdamW(optimizer_grouped_parameters)
         
-        # --- ИЗМЕНЕНИЕ: Замена старого блока загрузки на вызов новой функции ---
         model_version, global_step = initialize_model_and_state(model, optimizer, device, auth_repo_url)
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-        # Синхронизируем пул оппонентов ПОСЛЕ попытки git pull
+        # Синхронизация пула оппонентов
         GIT_OPPONENT_POOL_DIR = os.path.join(project_root, "opponent_pool")
         if os.path.exists(GIT_OPPONENT_POOL_DIR):
             print("Syncing opponent pool from Git...")
-            for f in glob.glob(os.path.join(GIT_OPPONENT_POOL_DIR, "*.pth")): shutil.copy2(f, LOCAL_OPPONENT_POOL_DIR)
+            for f in glob.glob(os.path.join(GIT_OPPONENT_POOL_DIR, "*.pth")): 
+                shutil.copy2(f, LOCAL_OPPONENT_POOL_DIR)
             print(f"Synced {len(os.listdir(LOCAL_OPPONENT_POOL_DIR))} opponents.")
 
         head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "2000"))
@@ -464,8 +544,18 @@ def main():
         log_queue = mp.Manager().Queue()
         stop_event = mp.Event()
 
-        inference_workers = [InferenceWorker(f"InferenceWorker-{i}", request_queue, (shm.name, result_array.shape, result_array.dtype), log_queue, stop_event) for i in range(NUM_INFERENCE_WORKERS)]
-        for w in inference_workers: w.start()
+        inference_workers = [
+            InferenceWorker(
+                f"InferenceWorker-{i}", 
+                request_queue, 
+                (shm.name, result_array.shape, result_array.dtype), 
+                log_queue, 
+                stop_event
+            ) for i in range(NUM_INFERENCE_WORKERS)
+        ]
+        
+        for w in inference_workers: 
+            w.start()
 
         print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
         solver_manager = SolverManager(
@@ -493,8 +583,10 @@ def main():
             while True:
                 if time.time() - last_stats_time > STATS_INTERVAL_SECONDS:
                     while not log_queue.empty():
-                        try: print(log_queue.get(timeout=0.01), flush=True)
-                        except queue.Empty: break
+                        try: 
+                            print(log_queue.get(timeout=0.01), flush=True)
+                        except queue.Empty: 
+                            break
                     
                     total_generated = policy_buffer.total_generated()
                     avg_p_loss = np.mean(policy_losses) if policy_losses else float('nan')
@@ -524,16 +616,21 @@ def main():
                 if value_buffer.size() < min_fill or policy_buffer.size() < min_fill:
                     if int(time.time()) % 5 == 0:
                         print(f"Waiting for buffer... P: {policy_buffer.size():,}/{min_fill:,} | V: {value_buffer.size():,}/{min_fill:,}", flush=True)
-                    time.sleep(1); continue
+                    time.sleep(1)
+                    continue
 
-                if not training_started: print("\nBuffer ready. Starting training..."); training_started = True
+                if not training_started: 
+                    print("\n🚀 Buffer ready. Starting training...")
+                    training_started = True
 
                 model.train()
                 if head_warmup_steps > 0 and global_step < head_warmup_steps:
                     head_names = ["value_head", "action_proj", "street_proj", "policy_head_fc", "body_ln", "action_ln", "street_ln"]
-                    for name, param in model.named_parameters(): param.requires_grad = any(h in name for h in head_names)
+                    for name, param in model.named_parameters(): 
+                        param.requires_grad = any(h in name for h in head_names)
                 else:
-                    for param in model.parameters(): param.requires_grad = True
+                    for param in model.parameters(): 
+                        param.requires_grad = True
 
                 v_batch = value_buffer.sample(BATCH_SIZE)
                 if not v_batch: continue
@@ -570,7 +667,9 @@ def main():
                 grad_norm = clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
                 
-                value_losses.append(loss_v.item()); policy_losses.append(loss_p.item()); global_step += 1
+                value_losses.append(loss_v.item())
+                policy_losses.append(loss_p.item())
+                global_step += 1
                 
                 if aim_run.active:
                     aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
@@ -586,38 +685,63 @@ def main():
 
                 is_first_save = (global_step >= FIRST_SAVE_STEP) and (last_save_step < FIRST_SAVE_STEP)
                 is_regular_save = (global_step - last_save_step) >= SAVE_INTERVAL_STEPS
+                
                 if training_started and (is_first_save or is_regular_save):
-                    print(f"\n--- Saving model at step {global_step} ---", flush=True); model_version += 1
-                    torch.save({'global_step': global_step, 'model_version': model_version, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict()}, MODEL_PATH + ".tmp")
+                    print(f"\n--- Saving model at step {global_step} ---", flush=True)
+                    model_version += 1
+                    torch.save({
+                        'global_step': global_step, 
+                        'model_version': model_version, 
+                        'model_state_dict': model.state_dict(), 
+                        'optimizer_state_dict': optimizer.state_dict()
+                    }, MODEL_PATH + ".tmp")
                     os.rename(MODEL_PATH + ".tmp", MODEL_PATH)
-                    with open(VERSION_FILE, 'w') as f: f.write(str(model_version))
-                    update_opponent_pool(model_version); last_save_step = global_step
+                    with open(VERSION_FILE, 'w') as f: 
+                        f.write(str(model_version))
+                    update_opponent_pool(model_version)
+                    last_save_step = global_step
                 
                 if training_started and (global_step - last_push_step) >= GIT_PUSH_INTERVAL_STEPS:
-                    git_push(f"Periodic save: v{model_version}, step {global_step}", auth_repo_url); last_push_step = global_step
+                    git_push(f"Periodic save: v{model_version}, step {global_step}", auth_repo_url)
+                    last_push_step = global_step
 
-        except KeyboardInterrupt: print("\nTraining interrupted by user.", flush=True)
+        except KeyboardInterrupt: 
+            print("\n⚠️ Training interrupted by user.", flush=True)
         finally:
             print("\n" + "="*15 + " SHUTDOWN PROCEDURE STARTED " + "="*15, flush=True)
-            if 'aim_run' in locals() and aim_run.active: print("1. Closing Aim session...", flush=True); aim_run.close(); print("   ✅ Aim session closed.", flush=True)
-            print("2. Sending stop signal to all workers...", flush=True); stop_event.set()
+            if 'aim_run' in locals() and aim_run.active: 
+                print("1. Closing Aim session...", flush=True)
+                aim_run.close()
+                print("   ✅ Aim session closed.", flush=True)
+            print("2. Sending stop signal to all workers...", flush=True)
+            stop_event.set()
             print("3. Stopping C++ workers...", flush=True)
-            if 'solver_manager' in locals(): solver_manager.stop()
+            if 'solver_manager' in locals(): 
+                solver_manager.stop()
             print("   ✅ C++ workers stopped.", flush=True)
             print("4. Stopping Python workers...", flush=True)
             if 'inference_workers' in locals():
                 for w in inference_workers:
                     w.join(timeout=5)
-                    if w.is_alive(): print(f"   - Force terminating {w.name}...", flush=True); w.terminate()
+                    if w.is_alive(): 
+                        print(f"   - Force terminating {w.name}...", flush=True)
+                        w.terminate()
             print("   ✅ Python workers stopped.", flush=True)
             if training_started:
                 print("5. Final model save and push...", flush=True)
                 try:
-                    torch.save({'global_step': global_step, 'model_version': model_version, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict()}, MODEL_PATH)
+                    torch.save({
+                        'global_step': global_step, 
+                        'model_version': model_version, 
+                        'model_state_dict': model.state_dict(), 
+                        'optimizer_state_dict': optimizer.state_dict()
+                    }, MODEL_PATH)
                     print("   ✅ Model saved locally.", flush=True)
                     git_push(f"Final save on exit: v{model_version}, step {global_step}", auth_repo_url)
-                except Exception as e: print(f"   ---! ❌ ERROR on final save/push: {e}", flush=True)
-            print("="*58); print("✅ Training process finished correctly.")
+                except Exception as e: 
+                    print(f"   ---! ❌ ERROR on final save/push: {e}", flush=True)
+            print("="*58)
+            print("✅ Training process finished correctly.")
 
 if __name__ == "__main__":
     main()
