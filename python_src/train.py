@@ -463,7 +463,7 @@ def main():
     torch.set_num_interop_threads(2)
     
     with SharedMemoryManager() as smm:
-        aim_run = aim.Run(experiment="paqn_ofc_poker_optimized_v2")
+        aim_run = aim.Run(experiment="paqn_ofc_poker_optimized_v3")  # ✅ Обновлена версия эксперимента
         aim_run["hparams"] = {
             "num_cpp_workers": NUM_CPP_WORKERS, 
             "num_inference_workers": NUM_INFERENCE_WORKERS,
@@ -542,7 +542,9 @@ def main():
         MAX_PENDING_REQUESTS = NUM_CPP_WORKERS * 4 
         RESULT_ROW_SIZE = FIRST_STREET_CANDIDATES + 2 
         
-        request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 16)
+        # ✅ ✅ ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Manager().Queue() для совместимости C++ ↔ Python
+        manager = mp.Manager()
+        request_queue = manager.Queue()
         
         shm = smm.SharedMemory(size=MAX_PENDING_REQUESTS * RESULT_ROW_SIZE * np.dtype(np.float32).itemsize)
         result_array = np.ndarray((MAX_PENDING_REQUESTS, RESULT_ROW_SIZE), dtype=np.float32, buffer=shm.buf)
