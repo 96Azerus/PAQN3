@@ -1,8 +1,25 @@
+# ===================================================================
+# ULTRATHINK OPTIMIZED CMakeLists.txt
+# ===================================================================
 cmake_minimum_required(VERSION 3.14)
 project(OFCEngine LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# --- ✅ Оптимизация флагов компиляции ---
+# Для Release-сборки включаем максимальную оптимизацию (-O3),
+# используем все доступные инструкции процессора (-march=native)
+# и отключаем assert'ы (-DNDEBUG) для скорости.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -DNDEBUG")
+    message(STATUS "🚀 Using Release build flags with native CPU optimizations.")
+# Для Debug-сборки оставляем отладочные символы.
+else()
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -fno-omit-frame-pointer")
+    message(STATUS "🛠️ Using Debug build flags.")
+endif()
+
 
 # --- Зависимости ---
 find_package(pybind11 REQUIRED)
@@ -37,5 +54,11 @@ target_link_libraries(ofc_engine PRIVATE
     Threads::Threads
 )
 
-# --- Опции компиляции ---
-target_compile_options(ofc_engine PRIVATE -O3 -g -fno-omit-frame-pointer)
+# --- ✅ Дополнительные опции для производительности ---
+# Включаем Link-Time Optimization (LTO) для Release сборок, если компилятор поддерживает
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported)
+if(ipo_supported)
+    set_property(TARGET ofc_engine PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    message(STATUS "✅ Link-Time Optimization (LTO) enabled for Release build.")
+endif()
