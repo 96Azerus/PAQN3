@@ -1,5 +1,6 @@
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "2")  # ✅ Было "1"
+# ✅ КРИТИЧЕСКИ ВАЖНО: Устанавливаем переменные окружения ПЕРЕД любыми импортами
+os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
@@ -7,18 +8,13 @@ os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("OMP_MAX_ACTIVE_LEVELS", "1")
 os.environ.setdefault("PYTHONFAULTHANDLER", "1")
 os.environ.setdefault("HEAD_WARMUP_STEPS", "2000")
-os.environ.setdefault("OMP_PROC_BIND", "spread")  # ✅ NUMA optimization
+os.environ.setdefault("OMP_PROC_BIND", "spread")
 os.environ.setdefault("OMP_PLACES", "threads")
 
 import sys
 import time
-import torch
-torch.set_num_threads(2)  # ✅ Было 1
-torch.set_num_interop_threads(2)  # ✅ Было 1
+# ❌ НЕ ИМПОРТИРУЕМ torch/aim ЗДЕСЬ - это вызывает deadlock в spawn!
 
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.nn.utils import clip_grad_norm_
 import numpy as np
 import traceback
 from collections import deque, defaultdict
@@ -31,11 +27,11 @@ import shutil
 import gc
 import psutil
 import threading
-import aim
 import json
 from multiprocessing import shared_memory
 from multiprocessing.managers import SharedMemoryManager
 
+# ✅ Устанавливаем spawn-метод ПЕРЕД любыми torch импортами
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
         mp.set_start_method('spawn', force=True)
@@ -49,7 +45,7 @@ if project_root not in sys.path:
 if build_dir not in sys.path:
     sys.path.insert(0, build_dir)
 
-from python_src.model import OFC_CNN_Network
+# ❌ НЕ импортируем model здесь!
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
 # --- КОНСТАНТЫ ---
@@ -62,8 +58,8 @@ STREET_END_IDX = 14
 FIRST_STREET_CANDIDATES = 2000
 
 # --- ОПТИМИЗИРОВАННЫЕ НАСТРОЙКИ для 224 ядер ---
-NUM_INFERENCE_WORKERS = 90   # ✅ Было 32, теперь 90!
-NUM_CPP_WORKERS = 130        # ✅ Было 160, теперь 130!
+NUM_INFERENCE_WORKERS = 90
+NUM_CPP_WORKERS = 130
 print(f"⚡ Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -78,8 +74,8 @@ POLICY_WEIGHT_SCHEDULE_STEPS = 100000
 VALUE_CLIP_VALUE = 50.0
 
 # --- КРИТИЧЕСКИ ВАЖНО: Батчинг ---
-INFERENCE_MAX_BATCH_SIZE = 256   # ✅ Было 512, меньше = быстрее
-INFERENCE_BATCH_TIMEOUT_MS = 0.5 # ✅ Было 5.0, теперь 0.5ms!
+INFERENCE_MAX_BATCH_SIZE = 256
+INFERENCE_BATCH_TIMEOUT_MS = 0.5
 
 # --- ПУТИ ---
 STATS_INTERVAL_SECONDS = 15
@@ -168,11 +164,13 @@ def get_params_for_optimizer(model, base_lr, weight_decay, head_lr_mult=2.0, hea
 
 def initialize_model_and_state(model, optimizer, device, auth_repo_url):
     """Надежная загрузка модели с fallback"""
+    # ✅ torch уже импортирован внутри main()
     model_version, global_step = 0, 0
     
     if os.path.exists(MODEL_PATH):
         print(f"Found local model at {MODEL_PATH}. Loading...")
         try:
+            import torch
             state_dict = torch.load(MODEL_PATH, map_location=device)
             model.load_state_dict(state_dict['model_state_dict'])
             optimizer.load_state_dict(state_dict['optimizer_state_dict'])
@@ -195,6 +193,7 @@ def initialize_model_and_state(model, optimizer, device, auth_repo_url):
     print("No model found locally or on GitHub. Starting training from scratch.")
     print("--- Performing initial save of randomly initialized model ---")
     try:
+        import torch
         torch.save({
             'global_step': 0,
             'model_version': 0,
@@ -224,7 +223,7 @@ class SharedNumpyArray:
         self.array = np.ndarray(shape, dtype=dtype, buffer=self.shm.buf)
 
 class InferenceWorker(mp.Process):
-    """✅ ПОЛНОСТЬЮ ОПТИМИЗИРОВАННЫЙ inference worker"""
+    """✅ ПОЛНОСТЬЮ ОПТИМИЗИРОВАННЫЙ inference worker с отложенным импортом torch"""
     
     def __init__(self, name, task_queue, result_shm_info, log_queue, stop_event):
         super().__init__(name=name)
@@ -241,7 +240,14 @@ class InferenceWorker(mp.Process):
         self.log_queue.put(f"[{self.name}] {message}")
 
     def _initialize(self):
+        """✅ КРИТИЧЕСКИ ВАЖНО: torch импортируется ЗДЕСЬ, внутри дочернего процесса!"""
         self._log("Started.")
+        
+        # ✅ ИМПОРТИРУЕМ torch ЛОКАЛЬНО!
+        import torch
+        from python_src.model import OFC_CNN_Network
+        
+        self.torch = torch  # Сохраняем ссылку
         self.device = torch.device("cpu")
         
         # ✅ Оптимизация PyTorch для этого worker
@@ -274,7 +280,7 @@ class InferenceWorker(mp.Process):
     def _load_models(self):
         try:
             if os.path.exists(MODEL_PATH):
-                state_dict = torch.load(MODEL_PATH, map_location=self.device)
+                state_dict = self.torch.load(MODEL_PATH, map_location=self.device)
                 self.latest_model.load_state_dict(state_dict.get('model_state_dict', state_dict))
                 self.model_version = state_dict.get('model_version', -1)
                 self._log(f"Loaded latest model (version {self.model_version}).")
@@ -290,7 +296,7 @@ class InferenceWorker(mp.Process):
             opponent_pool_files = glob.glob(os.path.join(LOCAL_OPPONENT_POOL_DIR, "*.pth"))
             if opponent_pool_files:
                 opponent_path = random.choice(opponent_pool_files)
-                state_dict = torch.load(opponent_path, map_location=self.device)
+                state_dict = self.torch.load(opponent_path, map_location=self.device)
                 self.opponent_model.load_state_dict(state_dict.get('model_state_dict', state_dict))
                 self._log(f"Loaded opponent model: {os.path.basename(opponent_path)}")
             else:
@@ -316,24 +322,21 @@ class InferenceWorker(mp.Process):
     def collect_batch(self):
         """✅ ОПТИМИЗИРОВАННЫЙ батчинг без exception overhead"""
         batch = []
-        timeout = INFERENCE_BATCH_TIMEOUT_MS / 1000.0  # 0.5ms
+        timeout = INFERENCE_BATCH_TIMEOUT_MS / 1000.0
         deadline = time.time() + timeout
         
-        # Ждем первый запрос с полным таймаутом
         try:
             first_req = self.task_queue.get(timeout=timeout)
             batch.append(first_req)
         except queue.Empty:
             return batch
         
-        # Быстро собираем остальные
         while len(batch) < INFERENCE_MAX_BATCH_SIZE:
             remaining_time = deadline - time.time()
             if remaining_time <= 0:
                 break
             
             try:
-                # Очень короткий таймаут вместо get_nowait()
                 req = self.task_queue.get(timeout=min(0.0001, remaining_time))
                 batch.append(req)
             except queue.Empty:
@@ -346,39 +349,33 @@ class InferenceWorker(mp.Process):
         if not batch: 
             return
 
-        # Группируем по типу модели
         groups = defaultdict(list)
         for req in batch:
             is_traverser_turn = req[3]
             model_key = 'latest' if is_traverser_turn else 'opponent'
             groups[model_key].append(req)
 
-        with torch.inference_mode():
+        with self.torch.inference_mode():
             for model_key, reqs in groups.items():
                 model = self.latest_model if model_key == 'latest' else self.opponent_model
                 
-                # Создаем тензор сразу правильного размера
-                infosets = torch.tensor(
+                infosets = self.torch.tensor(
                     [r[1] for r in reqs], 
-                    dtype=torch.float32, 
+                    dtype=self.torch.float32, 
                     device=self.device
                 ).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                 
-                # Forward pass через body
                 body_outputs = model.forward_body(infosets)
                 values = model.forward_value_head(body_outputs)
 
-                # Индексы запросов с policy
                 policy_req_indices = [i for i, r in enumerate(reqs) if r[2] is not None]
                 
-                # Записываем value для всех
                 for i, req in enumerate(reqs):
                     req_id = req[0]
                     self.result_array[req_id, 0] = values[i].item()
                     if i not in policy_req_indices:
-                        self.result_array[req_id, 1] = 1  # Готово
+                        self.result_array[req_id, 1] = 1
 
-                # Обрабатываем policy запросы батчем
                 if policy_req_indices:
                     action_vectors = []
                     splits = []
@@ -388,21 +385,20 @@ class InferenceWorker(mp.Process):
                         action_vectors.extend(action_vecs_for_req)
                         splits.append(len(action_vecs_for_req))
 
-                    action_tensor = torch.tensor(
+                    action_tensor = self.torch.tensor(
                         action_vectors, 
-                        dtype=torch.float32, 
+                        dtype=self.torch.float32, 
                         device=self.device
                     )
                     
                     policy_body_outputs = body_outputs[policy_req_indices]
                     policy_infosets = infosets[policy_req_indices]
                     
-                    # Repeat для каждого action
-                    repeat_counts = torch.tensor(splits, device=self.device)
-                    repeated_body_outputs = torch.repeat_interleave(
+                    repeat_counts = self.torch.tensor(splits, device=self.device)
+                    repeated_body_outputs = self.torch.repeat_interleave(
                         policy_body_outputs, repeat_counts, dim=0
                     )
-                    repeated_infosets = torch.repeat_interleave(
+                    repeated_infosets = self.torch.repeat_interleave(
                         policy_infosets, repeat_counts, dim=0
                     )
                     
@@ -413,7 +409,6 @@ class InferenceWorker(mp.Process):
                     )
                     results_flat = logits.cpu().numpy().flatten()
                     
-                    # Раздаём результаты
                     current_pos = 0
                     for i, num_actions in enumerate(splits):
                         req_idx_in_batch = policy_req_indices[i]
@@ -421,13 +416,13 @@ class InferenceWorker(mp.Process):
                         
                         self.result_array[req_id, 2:2+num_actions] = \
                             results_flat[current_pos : current_pos + num_actions]
-                        self.result_array[req_id, 1] = 1  # Готово
+                        self.result_array[req_id, 1] = 1
                         current_pos += num_actions
         
         # ✅ Метрики производительности
         self.inference_count += len(batch)
         now = time.time()
-        if now - self.last_throughput_log > 60:  # Каждую минуту
+        if now - self.last_throughput_log > 60:
             elapsed = now - self.last_throughput_log
             throughput = self.inference_count / elapsed
             avg_batch = self.inference_count / 60.0
@@ -454,8 +449,21 @@ class InferenceWorker(mp.Process):
         self.result_shm.close()
 
 def main():
+    """✅ torch/aim импортируются ЗДЕСЬ, в главном процессе"""
+    
+    # ✅ ИМПОРТИРУЕМ torch/aim ЛОКАЛЬНО!
+    import torch
+    import torch.nn.functional as F
+    import torch.optim as optim
+    from torch.nn.utils import clip_grad_norm_
+    import aim
+    from python_src.model import OFC_CNN_Network
+    
+    torch.set_num_threads(2)
+    torch.set_num_interop_threads(2)
+    
     with SharedMemoryManager() as smm:
-        aim_run = aim.Run(experiment="paqn_ofc_poker_optimized")
+        aim_run = aim.Run(experiment="paqn_ofc_poker_optimized_v2")
         aim_run["hparams"] = {
             "num_cpp_workers": NUM_CPP_WORKERS, 
             "num_inference_workers": NUM_INFERENCE_WORKERS,
@@ -517,7 +525,6 @@ def main():
         
         model_version, global_step = initialize_model_and_state(model, optimizer, device, auth_repo_url)
 
-        # Синхронизация пула оппонентов
         GIT_OPPONENT_POOL_DIR = os.path.join(project_root, "opponent_pool")
         if os.path.exists(GIT_OPPONENT_POOL_DIR):
             print("Syncing opponent pool from Git...")
@@ -544,6 +551,7 @@ def main():
         log_queue = mp.Manager().Queue()
         stop_event = mp.Event()
 
+        print(f"🚀 Starting {NUM_INFERENCE_WORKERS} InferenceWorkers...", flush=True)
         inference_workers = [
             InferenceWorker(
                 f"InferenceWorker-{i}", 
@@ -556,6 +564,9 @@ def main():
         
         for w in inference_workers: 
             w.start()
+        
+        # ✅ Даём время workers стартовать
+        time.sleep(2)
 
         print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
         solver_manager = SolverManager(
