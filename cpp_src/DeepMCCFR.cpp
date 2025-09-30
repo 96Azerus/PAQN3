@@ -51,19 +51,63 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     if (noise_sum > 1e-6) {
         const float exploration_fraction = 0.25f;
         for (size_t i = 0; i < strategy.size(); ++i) {
-            strategy[i] = (1.0f - exploration_fraction) * strategy[i] + exploration_fraction * (noise[i] / noise_sum);
+            strategy[i] = (1.0f - exploration_fraction) * strategy[i] + 
+                          exploration_fraction * (noise[i] / noise_sum);
         }
     }
 }
 
+// ✅ КРИТИЧЕСКАЯ ОПТИМИЗАЦИЯ: Smart wait вместо busy-wait
+inline void smart_wait_for_result(
+    float* result_array, 
+    size_t result_row_size, 
+    uint64_t request_id, 
+    int timeout_sec = 30
+) {
+    auto start_time = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::seconds(timeout_sec);
+    
+    // Exponential backoff strategy
+    int spin_count = 0;
+    const int MAX_SPIN = 100;  // Первые 100 итераций - spin без sleep
+    
+    while (result_array[request_id * result_row_size + 1] == 0) {
+        // Проверка таймаута
+        if (std::chrono::steady_clock::now() - start_time > timeout) {
+            throw std::runtime_error("Inference timeout");
+        }
+        
+        if (spin_count < MAX_SPIN) {
+            // Быстрый spin-lock для коротких задержек
+            spin_count++;
+            // CPU hint для снижения энергопотребления и освобождения ресурсов
+            #if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();  // x86 PAUSE instruction
+            #elif defined(__aarch64__)
+                __asm__ __volatile__("yield");  // ARM yield
+            #endif
+        } else {
+            // Exponential backoff после MAX_SPIN итераций
+            int sleep_ms = std::min(10, 1 + (spin_count - MAX_SPIN) / 50);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+            spin_count++;
+        }
+    }
+}
 
 std::atomic<uint64_t> DeepMCCFR::request_id_counter_{0};
 
-DeepMCCFR::DeepMCCFR(size_t action_limit, size_t first_street_candidates, size_t max_pending_requests,
-                     SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
-                     InferenceRequestQueue* request_queue, 
-                     float* result_array, size_t result_row_size,
-                     LogQueue* log_queue) 
+DeepMCCFR::DeepMCCFR(
+    size_t action_limit, 
+    size_t first_street_candidates, 
+    size_t max_pending_requests,
+    SharedReplayBuffer* policy_buffer, 
+    SharedReplayBuffer* value_buffer,
+    InferenceRequestQueue* request_queue, 
+    float* result_array, 
+    size_t result_row_size,
+    LogQueue* log_queue
+) 
     : policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       request_queue_(request_queue),
@@ -86,12 +130,14 @@ void DeepMCCFR::run_traversal() {
 
 std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
     std::vector<float> features(INFOSET_SIZE, 0.0f);
+    
     const int P_BOARD_TOP = 0, P_BOARD_MID = 1, P_BOARD_BOT = 2, P_HAND = 3;
     const int O_BOARD_TOP = 4, O_BOARD_MID = 5, O_BOARD_BOT = 6;
     const int P_DISCARDS = 7, DECK_REMAINING = 8;
     const int IS_STREET_1 = 9, IS_STREET_2 = 10, IS_STREET_3 = 11, IS_STREET_4 = 12, IS_STREET_5 = 13;
     const int O_DISCARD_COUNT = 14, TURN = 15;
     const int plane_size = NUM_SUITS * NUM_RANKS;
+    
     auto set_card = [&](int channel, Card card) {
         if (card != INVALID_CARD) {
             int suit = get_suit(card);
@@ -99,8 +145,10 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
             features[channel * plane_size + suit * NUM_RANKS + rank] = 1.0f;
         }
     };
+    
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
+    
     for (Card c : my_board.top) set_card(P_BOARD_TOP, c);
     for (Card c : my_board.middle) set_card(P_BOARD_MID, c);
     for (Card c : my_board.bottom) set_card(P_BOARD_BOT, c);
@@ -109,30 +157,50 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
     for (Card c : opp_board.middle) set_card(O_BOARD_MID, c);
     for (Card c : opp_board.bottom) set_card(O_BOARD_BOT, c);
     for (Card c : state.get_my_discards(player_view)) set_card(P_DISCARDS, c);
+    
     std::vector<bool> known_cards(52, false);
-    auto mark_known = [&](Card c) { if (c != INVALID_CARD) known_cards[c] = true; };
+    auto mark_known = [&](Card c) { 
+        if (c != INVALID_CARD) known_cards[c] = true; 
+    };
+    
     for (Card c : my_board.get_all_cards()) mark_known(c);
     for (Card c : opp_board.get_all_cards()) mark_known(c);
     for (Card c : state.get_dealt_cards()) mark_known(c);
     for (Card c : state.get_my_discards(player_view)) mark_known(c);
+    
     for (int c = 0; c < 52; ++c) {
         if (!known_cards[c]) {
             set_card(DECK_REMAINING, c);
         }
     }
+    
     int street = state.get_street();
     if (street >= 1 && street <= 5) {
         int street_channel = IS_STREET_1 + (street - 1);
-        std::fill(features.begin() + street_channel * plane_size, features.begin() + (street_channel + 1) * plane_size, 1.0f);
+        std::fill(
+            features.begin() + street_channel * plane_size, 
+            features.begin() + (street_channel + 1) * plane_size, 
+            1.0f
+        );
     }
+    
     float opp_discard_val = static_cast<float>(state.get_opponent_discard_count(player_view)) / 4.0f;
-    std::fill(features.begin() + O_DISCARD_COUNT * plane_size, features.begin() + (O_DISCARD_COUNT + 1) * plane_size, opp_discard_val);
+    std::fill(
+        features.begin() + O_DISCARD_COUNT * plane_size, 
+        features.begin() + (O_DISCARD_COUNT + 1) * plane_size, 
+        opp_discard_val
+    );
+    
     if (state.get_current_player() == player_view) {
-        std::fill(features.begin() + TURN * plane_size, features.begin() + (TURN + 1) * plane_size, 1.0f);
+        std::fill(
+            features.begin() + TURN * plane_size, 
+            features.begin() + (TURN + 1) * plane_size, 
+            1.0f
+        );
     }
+    
     return features;
 }
-
 
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root) {
     if (state.is_terminal()) {
@@ -143,18 +211,22 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int current_player = state.get_current_player();
     std::vector<Action> legal_actions;
     
+    // ✅ Оптимизированная генерация действий для первой улицы
     if (state.get_street() == 1) {
         std::vector<Action> candidates;
         state.get_first_street_candidates(first_street_candidates_, candidates, rng_);
         
         if (candidates.size() <= FIRST_STREET_ACTION_LIMIT) {
-            legal_actions = candidates;
+            legal_actions = std::move(candidates);
         } else {
+            // Фильтрация через нейросеть
             std::map<int, int> suit_map_filter;
             GameState canonical_state_filter = state.get_canonical(suit_map_filter);
             std::vector<float> infoset_vec_filter = featurize_state_cpp(canonical_state_filter, current_player);
+            
             std::vector<std::vector<float>> canonical_action_vectors_filter;
             canonical_action_vectors_filter.reserve(candidates.size());
+            
             for (const auto& original_action : candidates) {
                 Action canonical_action = original_action;
                 for (auto& placement : canonical_action.first) {
@@ -170,47 +242,58 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
             uint64_t filter_request_id = (request_id_counter_++) % max_pending_requests_;
             
+            // ✅ Минимизируем время удержания GIL
             {
                 py::gil_scoped_acquire acquire;
-                // Новый формат запроса: (req_id, infoset, action_vectors, is_traverser_turn, is_filter)
                 py::tuple filter_request = py::make_tuple(
                     filter_request_id, 
                     py::cast(infoset_vec_filter), 
                     py::cast(canonical_action_vectors_filter), 
-                    py::bool_(true), // is_traverser_turn
-                    py::bool_(true)  // is_filter
+                    py::bool_(true)  // is_traverser_turn
                 );
                 request_queue_->attr("put")(filter_request);
             }
 
-            std::vector<float> logits;
-            while(result_array_[filter_request_id * result_row_size_ + 1] == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // ✅ Smart wait вместо busy-wait
+            try {
+                smart_wait_for_result(result_array_, result_row_size_, filter_request_id, 30);
+            } catch (const std::runtime_error& e) {
+                py::gil_scoped_acquire acquire;
+                std::stringstream ss;
+                ss << "[C++ WORKER TIMEOUT] Filter inference timeout. Req ID: " << filter_request_id;
+                log_queue_->attr("put")(py::str(ss.str()));
+                return {{0, 0.0f}, {1, 0.0f}};
             }
-            logits.assign(&result_array_[filter_request_id * result_row_size_ + 2], 
-                          &result_array_[filter_request_id * result_row_size_ + 2 + candidates.size()]);
-            result_array_[filter_request_id * result_row_size_ + 1] = 0;
 
+            std::vector<float> logits(
+                &result_array_[filter_request_id * result_row_size_ + 2], 
+                &result_array_[filter_request_id * result_row_size_ + 2 + candidates.size()]
+            );
+            result_array_[filter_request_id * result_row_size_ + 1] = 0;  // Освобождаем слот
+
+            // ✅ Эффективная сортировка с partial_sort
             std::vector<size_t> indices(candidates.size());
             std::iota(indices.begin(), indices.end(), 0);
-            std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-                return logits[a] > logits[b];
-            });
-            std::vector<size_t> final_indices;
-            final_indices.reserve(FIRST_STREET_ACTION_LIMIT);
-            for(size_t i = 0; i < std::min((size_t)candidates.size(), FIRST_STREET_ACTION_LIMIT - FIRST_STREET_RANDOM_EXPLORE); ++i) {
+            
+            size_t top_k = std::min(candidates.size(), FIRST_STREET_ACTION_LIMIT - FIRST_STREET_RANDOM_EXPLORE);
+            std::partial_sort(
+                indices.begin(), 
+                indices.begin() + top_k, 
+                indices.end(), 
+                [&](size_t a, size_t b) { return logits[a] > logits[b]; }
+            );
+            
+            std::vector<size_t> final_indices(indices.begin(), indices.begin() + top_k);
+            
+            // Добавляем случайные действия для exploration
+            std::shuffle(indices.begin() + top_k, indices.end(), rng_);
+            for(size_t i = top_k; i < indices.size() && final_indices.size() < FIRST_STREET_ACTION_LIMIT; ++i) {
                 final_indices.push_back(indices[i]);
             }
-            std::shuffle(indices.begin(), indices.end(), rng_);
-            for(size_t idx : indices) {
-                if (final_indices.size() >= FIRST_STREET_ACTION_LIMIT) break;
-                if (std::find(final_indices.begin(), final_indices.end(), idx) == final_indices.end()) {
-                    final_indices.push_back(idx);
-                }
-            }
+            
             legal_actions.reserve(final_indices.size());
             for(size_t idx : final_indices) {
-                legal_actions.push_back(candidates[idx]);
+                legal_actions.push_back(std::move(candidates[idx]));
             }
         }
     } else {
@@ -220,6 +303,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int num_actions = legal_actions.size();
     UndoInfo undo_info;
 
+    // ✅ Быстрый путь для одного действия
     if (num_actions <= 1) {
         Action action_to_take = (num_actions == 1) ? legal_actions[0] : Action{{}, INVALID_CARD};
         state.apply_action(action_to_take, traversing_player, undo_info);
@@ -228,6 +312,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         return result;
     }
 
+    // ✅ Канонизация и векторизация действий
     std::map<int, int> suit_map;
     GameState canonical_state = state.get_canonical(suit_map);
     std::vector<float> infoset_vec = featurize_state_cpp(canonical_state, current_player);
@@ -237,6 +322,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     
     for (const auto& original_action : legal_actions) {
         Action canonical_action = original_action;
+        
         for (auto& placement : canonical_action.first) {
             if (placement.first != INVALID_CARD) {
                 auto it = suit_map.find(get_suit(placement.first));
@@ -245,27 +331,28 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                 }
             }
         }
+        
         if (canonical_action.second != INVALID_CARD) {
             auto it = suit_map.find(get_suit(canonical_action.second));
             if (it != suit_map.end()) {
                 canonical_action.second = get_rank(canonical_action.second) * 4 + it->second;
             }
         }
+        
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
     uint64_t request_id = (request_id_counter_++) % max_pending_requests_;
     bool is_traverser_turn = (current_player == traversing_player);
 
+    // ✅ Запрос к inference worker
     {
         py::gil_scoped_acquire acquire;
-        // Новый унифицированный формат запроса
         py::tuple request_tuple = py::make_tuple(
             request_id, 
             py::cast(infoset_vec), 
             py::cast(canonical_action_vectors), 
-            py::bool_(is_traverser_turn),
-            py::bool_(false) // is_filter
+            py::bool_(is_traverser_turn)
         );
         request_queue_->attr("put")(request_tuple);
     }
@@ -273,67 +360,80 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     std::vector<float> logits;
     float value_baseline = 0.0f;
     
-    auto start_time = std::chrono::steady_clock::now();
-    const auto timeout = std::chrono::seconds(30);
-
-    while(result_array_[request_id * result_row_size_ + 1] == 0) {
-        if (std::chrono::steady_clock::now() - start_time > timeout) {
-            {
-                py::gil_scoped_acquire acquire;
-                std::stringstream ss;
-                ss << "[C++ WORKER TIMEOUT] Waiting for inference result timed out. Req ID: " << request_id;
-                log_queue_->attr("put")(py::str(ss.str()));
-            }
-            return {{0, 0.0f}, {1, 0.0f}};
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // ✅ Smart wait для результата
+    try {
+        smart_wait_for_result(result_array_, result_row_size_, request_id, 30);
+    } catch (const std::runtime_error& e) {
+        py::gil_scoped_acquire acquire;
+        std::stringstream ss;
+        ss << "[C++ WORKER TIMEOUT] Main inference timeout. Req ID: " << request_id;
+        log_queue_->attr("put")(py::str(ss.str()));
+        return {{0, 0.0f}, {1, 0.0f}};
     }
 
     value_baseline = result_array_[request_id * result_row_size_ + 0];
-    logits.assign(&result_array_[request_id * result_row_size_ + 2], 
-                  &result_array_[request_id * result_row_size_ + 2 + num_actions]);
+    logits.assign(
+        &result_array_[request_id * result_row_size_ + 2], 
+        &result_array_[request_id * result_row_size_ + 2 + num_actions]
+    );
     
-    result_array_[request_id * result_row_size_ + 1] = 0;
+    result_array_[request_id * result_row_size_ + 1] = 0;  // Освобождаем слот
 
+    // ✅ Эффективная softmax с numerical stability
     std::vector<float> strategy(num_actions);
     if (!logits.empty() && logits.size() == num_actions) {
-        float max_logit = -std::numeric_limits<float>::infinity();
-        for(float l : logits) if(l > max_logit) max_logit = l;
+        float max_logit = *std::max_element(logits.begin(), logits.end());
         float sum_exp = 0.0f;
+        
         for (int i = 0; i < num_actions; ++i) {
             strategy[i] = std::exp(logits[i] - max_logit);
             sum_exp += strategy[i];
         }
+        
         if (sum_exp > 1e-6) {
-            for (int i = 0; i < num_actions; ++i) strategy[i] /= sum_exp;
+            float inv_sum = 1.0f / sum_exp;
+            for (int i = 0; i < num_actions; ++i) {
+                strategy[i] *= inv_sum;
+            }
         } else {
-            std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
+            float uniform = 1.0f / num_actions;
+            std::fill(strategy.begin(), strategy.end(), uniform);
         }
     } else {
-        std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
+        float uniform = 1.0f / num_actions;
+        std::fill(strategy.begin(), strategy.end(), uniform);
     }
 
+    // ✅ Exploration noise на корневом узле
     if (is_root) {
         add_dirichlet_noise(strategy, 0.3f, rng_);
     }
 
+    // Семплирование действия
     std::discrete_distribution<int> dist(strategy.begin(), strategy.end());
     int sampled_action_idx = dist(rng_);
 
+    // Рекурсивный traversal
     state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
     auto action_payoffs = traverse(state, traversing_player, false);
     state.undo_action(undo_info, traversing_player);
 
+    // Сохранение в replay buffer
     auto it = action_payoffs.find(current_player);
     if (it != action_payoffs.end()) {
         if (current_player == traversing_player) {
             float advantage = it->second - value_baseline;
-            policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
+            policy_buffer_->push(
+                infoset_vec, 
+                canonical_action_vectors[sampled_action_idx], 
+                advantage
+            );
         }
         
         value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
     }
+    
     return action_payoffs;
 }
 
-} // namespace ofc 
+} // namespace ofc
